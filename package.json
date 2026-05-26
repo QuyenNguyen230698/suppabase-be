@@ -1,0 +1,26 @@
+{
+  "name": "suppabase-be",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --max-http-header-size=32768 --env-file=.env.development --watch src/server.js",
+    "start": "node --max-http-header-size=32768 --env-file=.env.production src/server.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1050.0",
+    "bcrypt": "^5.1.1",
+    "cors": "^2.8.5",
+    "exceljs": "^4.4.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^7.4.0",
+    "file-type": "^19.6.0",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.3",
+    "mammoth": "^1.8.0",
+    "multer": "^1.4.5-lts.1",
+    "pdf-parse": "^1.1.1",
+    "pg": "^8.13.0",
+    "zod": "^4.4.3"
+  }
+}

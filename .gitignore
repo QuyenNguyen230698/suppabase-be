@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Environment files (chứa secrets — không commit)
+.env
+.env.*
+
+# Uploads (user-generated content)
+uploads/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
