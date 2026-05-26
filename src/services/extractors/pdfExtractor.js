@@ -45,14 +45,31 @@ function runInWorker(buffer) {
 }
 
 export async function extract(buffer) {
-  let text;
+  // Pass 1 — text-layer extraction via pdf-parse. Fast and free.
+  let text = '';
+  let parseError = null;
   try {
     text = await runInWorker(buffer);
   } catch (err) {
-    throw new Error(`Could not parse PDF: ${err.message}`);
+    parseError = err;
   }
-  if (!text || !text.trim()) {
-    throw new Error('PDF has no extractable text (may be a scanned image-only PDF)');
+  if (text && text.trim().length >= 20) return text;
+
+  // Pass 2 — vision OCR fallback (scanned PDFs, image-only exports). Renders
+  // every page to PNG via pdfjs + canvas, uploads to R2, then asks the vision
+  // model to OCR all pages in one call.
+  console.log(`[pdf] text layer empty (${parseError?.message || 'no text'}), falling back to OCR`);
+  try {
+    const { extractByOcr } = await import('./pdfOcrFallback.js');
+    const ocrText = await extractByOcr(buffer);
+    if (ocrText && ocrText.trim()) return ocrText;
+  } catch (err) {
+    console.warn('[pdf] OCR fallback failed:', err.message);
   }
-  return text;
+
+  throw new Error(
+    parseError
+      ? `Could not parse PDF: ${parseError.message}`
+      : 'PDF has no extractable text and OCR fallback returned empty'
+  );
 }

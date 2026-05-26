@@ -189,6 +189,50 @@ export async function vision({ imageBuffer, prompt, systemPrompt, model, signal 
   return { content, raw: data, logId };
 }
 
+// Vision via URL — uses the OpenAI-compatible chat/completions endpoint so we
+// can pass `image_url` parts pointing at R2 directly. The model fetches the
+// image itself; we never have to base64-encode + ship binary, and embedding
+// quota is not consumed. Works on Llama 3.2 Vision and Llama 4 Scout.
+export async function visionFromUrl({ imageUrls, prompt, systemPrompt, model, signal, options = {} }) {
+  assertConfigured();
+  const useModel = model || DEFAULT_VISION_MODEL;
+  const urls = Array.isArray(imageUrls) ? imageUrls : [imageUrls];
+
+  const userContent = [
+    { type: 'text', text: prompt },
+    ...urls.map((url) => ({ type: 'image_url', image_url: { url } })),
+  ];
+
+  const messages = [];
+  if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
+  messages.push({ role: 'user', content: userContent });
+
+  const body = {
+    model: useModel,
+    messages,
+    temperature: options.temperature ?? 0.2,
+    max_tokens: options.max_tokens ?? 2048,
+  };
+
+  const res = await fetch(openaiCompatEndpoint(), {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    const err = new Error(`Cloudflare vision-by-url failed (${res.status}): ${text.slice(0, 300)}`);
+    err.code = res.status >= 500 ? 'ERR_CF_UPSTREAM' : 'ERR_CF_REQUEST';
+    err.status = res.status;
+    throw err;
+  }
+  const data = await res.json();
+  const content = data.choices?.[0]?.message?.content || '';
+  return { content, raw: data, logId: res.headers.get('cf-aig-log-id') || null };
+}
+
 export const models = {
   chat: DEFAULT_CHAT_MODEL,
   vision: DEFAULT_VISION_MODEL,

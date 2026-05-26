@@ -31,6 +31,8 @@ import * as cache from './semanticCache.js';
 import { generateEmbedding } from './embeddingService.js';
 import { toolsForAgent } from './tools/index.js';
 import { runWithTools } from './toolExecutor.js';
+import { detectLanguage, languageDirective } from './languageDetector.js';
+import { stripLeadingThinking } from './thinkingStripper.js';
 
 // Split a cached response into ~20-char chunks so the SSE replay still feels
 // streamed instead of arriving as a single dump.
@@ -146,6 +148,45 @@ export async function saveAssistantMessage({ convId, content, model, reasoning, 
     console.warn('[chatCore] saveAssistantMessage:', e.message);
     return null;
   }
+}
+
+// Load prior turns of a conversation as a chat-message array (no system),
+// so the model sees the full thread even when the client only sent the new
+// turn. Capped at `limit` most-recent rows to stay within context window.
+// Returns [] when the conversation doesn't belong to userId.
+export async function loadConversationMessages({ userId, conversationId, limit = 40 }) {
+  if (!conversationId || !userId) return [];
+  const { rows } = await query(
+    `SELECT role, content
+       FROM messages
+      WHERE conversation_id = $1
+        AND is_deleted = FALSE
+        AND role IN ('user','assistant')
+        AND content IS NOT NULL AND content <> ''
+        AND conversation_id IN (SELECT id FROM conversations WHERE id = $1 AND user_id = $2)
+      ORDER BY created_at DESC
+      LIMIT $3`,
+    [conversationId, userId, limit],
+  );
+  return rows.reverse().map((r) => ({ role: r.role, content: r.content }));
+}
+
+// Collect every image document_id ever attached in this conversation,
+// so a model switch mid-thread still sees the previously uploaded images.
+export async function loadConversationImageDocIds({ userId, conversationId }) {
+  if (!conversationId || !userId) return [];
+  const { rows } = await query(
+    `SELECT DISTINCT d.id
+       FROM documents d
+  LEFT JOIN message_documents md ON md.document_id = d.id
+  LEFT JOIN messages m            ON m.id = md.message_id
+      WHERE d.user_id = $1
+        AND d.kind = 'image'
+        AND d.r2_key IS NOT NULL
+        AND (d.conversation_id = $2 OR m.conversation_id = $2)`,
+    [userId, conversationId],
+  );
+  return rows.map((r) => r.id);
 }
 
 async function linkDocumentsToMessage({ messageId, convId, docIds }) {
@@ -396,20 +437,22 @@ export async function streamChat(req, res, opts) {
     inputWarnings = verdict.warnings || [];
   }
 
-  // 1a. Look up project custom instructions when conversation is in a project
+  // 1a. Look up project custom instructions + conversation summary in one query
   let projectInstructions = '';
+  let conversationSummary = '';
   if (conversationId && userId) {
     try {
       const { rows } = await query(
-        `SELECT p.custom_instructions
+        `SELECT c.summary, p.custom_instructions
            FROM conversations c
-           JOIN projects p ON p.id = c.project_id AND p.user_id = c.user_id
+      LEFT JOIN projects p ON p.id = c.project_id AND p.user_id = c.user_id
           WHERE c.id = $1 AND c.user_id = $2`,
         [conversationId, userId]
       );
       projectInstructions = (rows[0]?.custom_instructions || '').trim();
+      conversationSummary = (rows[0]?.summary || '').trim();
     } catch (err) {
-      console.warn('[chatCore] project instructions lookup failed:', err.message);
+      console.warn('[chatCore] project/summary lookup failed:', err.message);
     }
   }
 
@@ -427,10 +470,23 @@ export async function streamChat(req, res, opts) {
   if (projectInstructions) {
     systemPrompt = `${systemPrompt}\n\n---\n[Project context]\n${projectInstructions}`;
   }
+  // Earlier-turns summary — populated by the conversation_summary background
+  // job. Lets the model recall the gist of older turns even when history was
+  // truncated by the per-request window.
+  if (conversationSummary) {
+    systemPrompt = `${systemPrompt}\n\n---\n[Earlier conversation summary]\n${conversationSummary}`;
+  }
   if (userId) {
-    const memoryBlock = await buildMemoryBlock(userId);
+    const memoryBlock = await buildMemoryBlock(userId, lastUserMsg?.content);
     if (memoryBlock) systemPrompt = `${systemPrompt}${memoryBlock}`;
   }
+
+  // Per-turn language directive — reply in the language of the LATEST user
+  // message even if earlier turns / system prompt are in another language.
+  if (lastUserMsg?.content) {
+    systemPrompt = `${systemPrompt}${languageDirective(detectLanguage(lastUserMsg.content))}`;
+  }
+
   const finalMessages = systemPrompt
     ? [{ role: 'system', content: systemPrompt }, ...userMessages]
     : userMessages;
@@ -559,9 +615,16 @@ export async function streamChat(req, res, opts) {
       if (toolRun.trace.length) {
         writeSse(res, { type: 'tool_trace', steps: toolRun.trace });
       }
+      // Strip leading plain-prose thinking (qwq / r1-native) — same as the
+      // streaming branch below.
+      const toolStripped = stripLeadingThinking(toolRun.content);
+      const toolReasoning = toolStripped.reasoning || '';
+      const toolContentClean = toolStripped.content;
+      if (toolReasoning) writeSse(res, { type: 'thinking', content: toolReasoning });
+
       // L6 — scan the tool-loop final content before streaming it out.
-      const toolHarm = scanOutputHarmful(toolRun.content);
-      const toolFinalContent = toolHarm.harmful ? toolHarm.safeText : toolRun.content;
+      const toolHarm = scanOutputHarmful(toolContentClean);
+      const toolFinalContent = toolHarm.harmful ? toolHarm.safeText : toolContentClean;
 
       // Fake-stream the final content in chunks for UX parity
       for (const c of chunkifyForReplay(toolFinalContent)) {
@@ -581,7 +644,7 @@ export async function streamChat(req, res, opts) {
         assistantMsgId = await saveAssistantMessage({
           convId,
           content: toolFinalContent,
-          reasoning: null,
+          reasoning: toolReasoning || null,
           model,
           tokensIn: toolRun.tokensIn,
           tokensOut: toolRun.tokensOut,
@@ -694,12 +757,30 @@ export async function streamChat(req, res, opts) {
 
   try {
     await parser.feed(reader, async (summary) => {
+      // Strip plain-prose chain-of-thought emitted by thinking models that
+      // don't wrap reasoning in <think>...</think> (qwq-32b, some r1 variants
+      // on the native endpoint). The stream parser couldn't tell prose-CoT
+      // from real content on the fly, so we split now — moving the leading
+      // English thinking block into `reasoning` and emitting a `content_replaced`
+      // SSE so the FE can overwrite what it already streamed.
+      let preHarmContent = summary.content;
+      let preHarmReasoning = summary.reasoning || '';
+      const stripped = stripLeadingThinking(summary.content);
+      if (stripped.reasoning && stripped.content !== summary.content) {
+        preHarmContent = stripped.content;
+        preHarmReasoning = preHarmReasoning
+          ? `${preHarmReasoning}\n\n${stripped.reasoning}`
+          : stripped.reasoning;
+        writeSse(res, { type: 'thinking', content: stripped.reasoning });
+        writeSse(res, { type: 'content_replaced', content: stripped.content, reason: 'thinking_stripped' });
+      }
+
       // L6 — Harmful output scan. Runs against the FULL drained content.
       // If trips, we replace the persisted content with a refusal AND emit a
       // `harmful_output_replaced` SSE event so the FE can overwrite what it
       // already streamed. Cache write is skipped for harmful responses.
-      let finalContent = summary.content;
-      const harm = scanOutputHarmful(summary.content);
+      let finalContent = preHarmContent;
+      const harm = scanOutputHarmful(preHarmContent);
       if (harm.harmful) {
         finalContent = harm.safeText;
         writeSse(res, {
@@ -715,7 +796,7 @@ export async function streamChat(req, res, opts) {
         assistantMsgId = await saveAssistantMessage({
           convId,
           content:   finalContent,
-          reasoning: summary.reasoning,
+          reasoning: preHarmReasoning,
           model,
           tokensIn:  summary.tokensIn,
           tokensOut: summary.tokensOut,
@@ -750,13 +831,13 @@ export async function streamChat(req, res, opts) {
 
       // Save to L2 cache (fire-and-forget). Skip very short responses (likely
       // errors) AND harmful outputs (we don't want to serve them from cache).
-      if (cacheable && !harm.harmful && summary.content && summary.content.length > 20) {
+      if (cacheable && !harm.harmful && finalContent && finalContent.length > 20) {
         try {
           const emb = userEmbedding || (await generateEmbedding(lastUserMsg.content).catch(() => null));
           cache.save({
             ...cacheKey,
-            content: summary.content,
-            reasoning: summary.reasoning,
+            content: finalContent,
+            reasoning: preHarmReasoning,
             embedding: emb,
           });
         } catch (err) {

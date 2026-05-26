@@ -1,13 +1,16 @@
 import { query } from '../db/index.js';
 import { resolveLocale, buildSystemPrompt } from '../services/promptService.js';
-import { similaritySearch, buildContext, buildAttachmentManifest } from '../services/ragService.js';
+import { similaritySearch, similaritySearchInConversation, buildContext, buildAttachmentManifest } from '../services/ragService.js';
 import { fetchFromR2 } from '../services/r2Service.js';
 import {
   streamChat,
   listConversationsBySource,
   getConversationWithMessages,
   deleteConversationBySource,
+  loadConversationMessages,
+  loadConversationImageDocIds,
 } from '../services/chatCore.js';
+import { buildImageContext } from './chatController.js';
 
 const PEB_API_URL = 'https://supabase.pebsteel.com/functions/v1/ollama-proxy';
 const PEB_API_KEY = process.env.PEB_API_KEY || '';
@@ -92,14 +95,11 @@ export async function pebChat(req, res) {
     try { body = JSON.parse(req.body.payload); } catch { body = req.body; }
   }
 
-  const { model, messages, conversation_id, document_ids } = body;
+  const { model, messages: clientMessages, conversation_id, document_ids } = body;
   const streamRaw = body.stream;
   const stream = streamRaw === false || streamRaw === 'false' ? false : true;
   const imageFile = req.file || null;
 
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return res.status(400).json({ error: 'messages[] is required', code: 'ERR_MESSAGES_REQUIRED' });
-  }
   if (!PEB_API_KEY) {
     return res.status(503).json({ error: 'PEB API key not configured', code: 'ERR_PEB_NOT_CONFIGURED' });
   }
@@ -108,32 +108,74 @@ export async function pebChat(req, res) {
   const pebModel = model || PEB_MODEL;
   const locale = resolveLocale(req);
 
-  // Resolve attached documents:
-  //   - text/code docs   → RAG context spliced into the system prompt
-  //   - images          → fetched from R2 and shipped as multipart `image`
-  //                        field (the only form the upstream accepts; JSON
-  //                        messages[].images is silently dropped)
-  const docIds = Array.isArray(document_ids) && document_ids.length ? document_ids : null;
+  // Hydrate history from DB so a model switch into PEB mid-conversation still
+  // sees prior turns (and the new turn from the client). Client may still
+  // send full messages[] for BC.
+  let messages = Array.isArray(clientMessages) ? clientMessages.filter((m) => m && m.role && m.content) : [];
+  if (conversation_id) {
+    try {
+      const history = await loadConversationMessages({ userId, conversationId: conversation_id });
+      const lastClientUser = [...messages].reverse().find((m) => m.role === 'user');
+      const lastDbContent = history.length ? history[history.length - 1].content : null;
+      const newUserTurn = lastClientUser && lastClientUser.content !== lastDbContent
+        ? [{ role: 'user', content: lastClientUser.content }]
+        : [];
+      messages = [...history, ...newUserTurn];
+    } catch (err) {
+      console.warn('[peb] history hydrate failed:', err.message);
+    }
+  }
+  if (!messages.length) {
+    return res.status(400).json({ error: 'messages[] or conversation_id with a new user message is required', code: 'ERR_MESSAGES_REQUIRED' });
+  }
+
+  // Union request doc_ids with every image ever attached to this conversation
+  // — otherwise asking "what was in that image?" on a later turn produces a
+  // "I can't see images" reply because docIds is empty.
+  let docIds = Array.isArray(document_ids) && document_ids.length ? [...document_ids] : [];
+  if (conversation_id) {
+    try {
+      const prior = await loadConversationImageDocIds({ userId, conversationId: conversation_id });
+      for (const id of prior) if (!docIds.includes(id)) docIds.push(id);
+    } catch (err) {
+      console.warn('[peb] prior image docs lookup failed:', err.message);
+    }
+  }
+  if (!docIds.length) docIds = null;
+
   let ragContext = '';
   let attachedImage = null;   // multer-shaped { buffer, mimetype, originalname }
   if (docIds) {
+    const lastUser = [...messages].reverse().find((m) => m.role === 'user');
     try {
-      const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+      if (lastUser?.content && conversation_id) {
+        const convChunks = await similaritySearchInConversation(lastUser.content, userId, conversation_id);
+        if (convChunks.length) ragContext = buildContext(convChunks) || '';
+      }
       if (lastUser?.content) {
         const chunks = await similaritySearch(lastUser.content, userId, docIds);
-        ragContext = buildContext(chunks) || '';
+        const reqCtx = buildContext(chunks) || '';
+        if (reqCtx) ragContext = ragContext ? `${reqCtx}\n\n${ragContext}` : reqCtx;
       }
     } catch (err) {
       console.warn('[peb] RAG lookup failed:', err.message);
     }
-    // Manifest of ALL attached files (even those that didn't surface in RAG),
-    // so the model can reference every file by name and not pretend a missing
-    // one doesn't exist.
     try {
       const manifest = await buildAttachmentManifest(docIds, userId);
       if (manifest) ragContext = ragContext ? `${manifest}\n\n${ragContext}` : manifest;
     } catch (err) {
       console.warn('[peb] manifest failed:', err.message);
+    }
+    // Image context — ALWAYS OCR/describe via Cloudflare vision and inject as
+    // text. The PEB upstream may not be multimodal (qwen-32b text variant),
+    // so without this the model sees nothing and replies "I can't see images".
+    // We still ship the first image as multipart below for vision-capable
+    // PEB upstreams, but the OCR text is the safety net.
+    try {
+      const imgCtx = await buildImageContext(docIds, userId, { rich: true });
+      if (imgCtx) ragContext = ragContext ? `${ragContext}\n\n---\n\n${imgCtx}` : imgCtx;
+    } catch (err) {
+      console.warn('[peb] image context failed:', err.message);
     }
     try {
       attachedImage = await loadImageFromR2(docIds, userId);

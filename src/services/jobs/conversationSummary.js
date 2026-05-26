@@ -67,7 +67,7 @@ async function summarize(convId) {
 export default {
   name: 'conversation_summary',
   description: `Auto-summarize conversations ≥ ${MIN_MESSAGES} messages; re-summarize when updated (batches of ${BATCH}/hour).`,
-  intervalMs: 60 * 60 * 1000, // 1h
+  intervalMs: 10 * 60 * 1000, // 10 min — keep summary fresh enough to be useful in-chat
   runAtBoot: false,
   async run() {
     const candidates = await pickCandidates();

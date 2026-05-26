@@ -2,10 +2,11 @@ import crypto from 'crypto';
 import { query } from '../db/index.js';
 import { chat as aiChat, openChatStream } from '../services/aiProvider.js';
 import { shouldFallback as quotaExceeded } from '../services/neuronsTracker.js';
-import { similaritySearch, buildContext, buildAttachmentManifest } from '../services/ragService.js';
+import { similaritySearch, similaritySearchInConversation, buildContext, buildAttachmentManifest } from '../services/ragService.js';
 import { resolveLocale, buildSystemPrompt } from '../services/promptService.js';
-import { extractTextFromImage } from '../services/ocrService.js';
-import { fetchFromR2 } from '../services/r2Service.js';
+import { extractTextFromImage, describeImagesByUrl } from '../services/ocrService.js';
+import { fetchFromR2, r2PublicUrl } from '../services/r2Service.js';
+import { supportsVision } from '../services/modelCapabilities.js';
 import {
   streamChat,
   listConversationsBySource,
@@ -14,6 +15,8 @@ import {
   upsertConversation,
   saveUserMessage,
   saveAssistantMessage,
+  loadConversationMessages,
+  loadConversationImageDocIds,
 } from '../services/chatCore.js';
 
 // For image attachments we pull the bytes back from R2 and run the vision
@@ -21,31 +24,53 @@ import {
 // like document RAG does. Result is concatenated with regular RAG context.
 // Exported so pebController can reuse the exact same pipeline — otherwise
 // images uploaded while on Pro/PEB never reach the model.
-export async function buildImageContext(docIds, userId) {
+export async function buildImageContext(docIds, userId, opts = {}) {
   if (!docIds?.length) return '';
   const { rows } = await query(
-    `SELECT id, name, r2_key FROM documents
+    `SELECT id, name, r2_key, r2_public_url FROM documents
      WHERE user_id = $1 AND id = ANY($2::uuid[]) AND kind = 'image' AND r2_key IS NOT NULL`,
     [userId, docIds],
   );
   if (!rows.length) return '';
 
+  const rich = opts.rich !== false;
+
+  // Path A: batch vision-by-URL via Cloudflare OpenAI-compat endpoint.
+  // Model fetches each image directly from R2 — no base64, no embed pipeline,
+  // multiple images in one call.
+  const urlable = rows
+    .map((r) => ({ row: r, url: r.r2_public_url || r2PublicUrl(r.r2_key) }))
+    .filter((x) => !!x.url);
+
+  if (urlable.length) {
+    const urls = urlable.map((x) => x.url);
+    console.log(`[chat] vision-by-url: describing ${urls.length} image(s):`);
+    for (const x of urlable) console.log(`  - "${x.row.name}" → ${x.url}`);
+    const result = await describeImagesByUrl(urls, { rich });
+    if (result.ok && result.content) {
+      console.log(`[chat] vision-by-url: ok, ${result.content.length} chars`);
+      const namesList = urlable
+        .map((x, i) => `IMAGE ${i + 1}: "${x.row.name}" (${x.url})`)
+        .join('\n');
+      return `[Mô tả các ảnh người dùng đã đính kèm — model vision đã đọc trực tiếp từ R2. Có ${urlable.length} ảnh trong cuộc trò chuyện này, hãy mô tả TẤT CẢ khi được hỏi về ảnh.]\n${namesList}\n\n${result.content}\n\n(Khi trả lời, dựa vào mô tả trên để nói về nội dung TỪNG ảnh trong số ${urlable.length} ảnh, nêu rõ ảnh số mấy nếu có nhiều ảnh. KHÔNG nói rằng bạn chỉ thấy 1 ảnh khi danh sách trên có nhiều ảnh.)`;
+    }
+    console.warn('[chat] vision-by-url empty, falling back to buffer OCR:', result.reason);
+  }
+
+  // Path B fallback: download each image and OCR via native vision endpoint.
   const parts = [];
   for (const row of rows) {
     try {
       const buf = await fetchFromR2(row.r2_key);
-      const text = await extractTextFromImage(buf);
+      const text = await extractTextFromImage(buf, { rich });
       if (text && text.length > 5) {
         parts.push(`[Hình ảnh "${row.name}" — đã trích xuất bằng vision]\n${text}`);
       } else {
-        // Vision returned empty (often: quota exhausted, unsupported format,
-        // or genuinely no extractable text). Tell the model the image WAS
-        // attached so it doesn't gaslight the user with "no image uploaded".
-        parts.push(`[Hình ảnh "${row.name}" đã được người dùng đính kèm nhưng hệ thống vision tạm thời không trích xuất được nội dung. Hãy thông báo lại với người dùng rằng dịch vụ vision đang gặp sự cố, không nói rằng họ chưa upload ảnh.]`);
+        parts.push(`[Hình ảnh "${row.name}" đã được đính kèm. Hệ thống không trích xuất được nội dung văn bản từ ảnh này. Hãy thừa nhận có ảnh và đề nghị người dùng mô tả lại, KHÔNG bịa nội dung.]`);
       }
     } catch (err) {
       console.warn(`[chat] image fetch/vision failed for ${row.id}:`, err.message);
-      parts.push(`[Hình ảnh "${row.name}" đã được người dùng đính kèm nhưng không xử lý được do lỗi hệ thống. Đừng nói rằng họ chưa upload ảnh.]`);
+      parts.push(`[Hình ảnh "${row.name}" đã được đính kèm nhưng xử lý thất bại. Báo người dùng rằng có lỗi tạm thời khi đọc ảnh và đề nghị thử lại. KHÔNG bịa nội dung ảnh.]`);
     }
   }
   return parts.length ? parts.join('\n\n---\n\n') : '';
@@ -113,24 +138,86 @@ export async function publicChat(req, res) {
 
 /** Authenticated chat with persistence + optional RAG. */
 export async function sendMessage(req, res) {
-  const { model, messages, conversation_id, document_ids, agent_template_id } = req.body;
+  const { model, messages: clientMessages, conversation_id, document_ids, agent_template_id } = req.body;
   const stream = req.body.stream === false || req.body.stream === 'false' ? false : true;
 
-  if (!model || !Array.isArray(messages) || messages.length === 0) {
-    return res.status(400).json({ error: 'model and messages[] are required', code: 'ERR_MESSAGES_REQUIRED' });
+  if (!model) {
+    return res.status(400).json({ error: 'model is required', code: 'ERR_MESSAGES_REQUIRED' });
   }
 
   const userId = req.user.id;
   const locale = resolveLocale(req);
 
-  const docIds = Array.isArray(document_ids) && document_ids.length ? document_ids : null;
+  // History merge — server is the source of truth.
+  // When a conversation_id is provided, hydrate prior turns from DB so a
+  // model/provider switch mid-thread still sees the full context (and any
+  // previously uploaded images, see image union below). Client may still
+  // send `messages[]` for backwards compat (or to send a new turn); we
+  // append only the last user message from the client to the DB history
+  // to avoid duplicating turns already persisted.
+  let messages = Array.isArray(clientMessages) ? clientMessages.filter((m) => m && m.role && m.content) : [];
+
+  if (conversation_id) {
+    try {
+      const history = await loadConversationMessages({ userId, conversationId: conversation_id });
+      const lastClientUser = [...messages].reverse().find((m) => m.role === 'user');
+      const lastDbContent = history.length ? history[history.length - 1].content : null;
+      const newUserTurn = lastClientUser && lastClientUser.content !== lastDbContent
+        ? [{ role: 'user', content: lastClientUser.content }]
+        : [];
+      messages = [...history, ...newUserTurn];
+    } catch (err) {
+      console.warn('[chat] history hydrate failed:', err.message);
+    }
+  }
+
+  if (!messages.length) {
+    return res.status(400).json({ error: 'messages[] or conversation_id with a new user message is required', code: 'ERR_MESSAGES_REQUIRED' });
+  }
+
+  // Image docs — union of: docs sent on this request + every image previously
+  // attached in this conversation. Lets the model "remember" earlier uploads
+  // even after switching to a different provider.
+  let docIds = Array.isArray(document_ids) && document_ids.length ? [...document_ids] : [];
+  if (conversation_id) {
+    try {
+      const prior = await loadConversationImageDocIds({ userId, conversationId: conversation_id });
+      for (const id of prior) if (!docIds.includes(id)) docIds.push(id);
+    } catch (err) {
+      console.warn('[chat] prior image docs lookup failed:', err.message);
+    }
+  }
+  if (!docIds.length) docIds = null;
+
+  // No vision-capability gate here — when the chat model is text-only, the
+  // image is described via the vision-by-url path (buildImageContext below)
+  // and the description is injected as text into the system prompt. The
+  // model never has to "see" pixels itself.
+
   let ragContext = '';
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user');
+
+  // Conversation-wide RAG — answers "what was in that file I uploaded earlier?"
+  // even when the client doesn't re-send doc_ids on the new turn.
+  if (lastUser && conversation_id) {
+    try {
+      const convChunks = await similaritySearchInConversation(lastUser.content, userId, conversation_id);
+      if (convChunks.length) {
+        ragContext = buildContext(convChunks) || '';
+      }
+    } catch (err) {
+      console.warn('[chat] conv-wide RAG failed:', err.message);
+    }
+  }
+
   if (docIds) {
     try {
-      const lastUser = [...messages].reverse().find((m) => m.role === 'user');
       if (lastUser) {
         const chunks = await similaritySearch(lastUser.content, userId, docIds);
-        ragContext = buildContext(chunks) || '';
+        const requestCtx = buildContext(chunks) || '';
+        if (requestCtx) {
+          ragContext = ragContext ? `${requestCtx}\n\n${ragContext}` : requestCtx;
+        }
       }
     } catch (err) {
       console.warn('[chat] RAG lookup failed:', err.message);
@@ -148,7 +235,7 @@ export async function sendMessage(req, res) {
     // Image attachments: OCR them and append their text to the RAG context so
     // the language model can reason over the visual content too.
     try {
-      const imgCtx = await buildImageContext(docIds, userId);
+      const imgCtx = await buildImageContext(docIds, userId, { rich: supportsVision(model) });
       if (imgCtx) {
         ragContext = ragContext ? `${ragContext}\n\n---\n\n${imgCtx}` : imgCtx;
       }
@@ -251,12 +338,21 @@ async function sendMessageNonStreaming(req, res, { model, messages, userId, loca
       meta: { userId, conversationId: convId, model },
     });
     const rawContent = result.content || '';
-    const reasoning = result.reasoning || '';
+    let reasoning = result.reasoning || '';
+
+    // Strip leading plain-prose thinking (qwq, r1-native) so it ends up in
+    // `reasoning` instead of leaking into the visible answer.
+    const { stripLeadingThinking } = await import('../services/thinkingStripper.js');
+    const stripped = stripLeadingThinking(rawContent);
+    const postStripContent = stripped.reasoning ? stripped.content : rawContent;
+    if (stripped.reasoning) {
+      reasoning = reasoning ? `${reasoning}\n\n${stripped.reasoning}` : stripped.reasoning;
+    }
 
     // L6 output scan — replace harmful output with refusal before persist/return.
     const { scanOutputHarmful, logHarmfulOutput } = await import('../services/guardService.js');
-    const harm = scanOutputHarmful(rawContent);
-    const content = harm.harmful ? harm.safeText : rawContent;
+    const harm = scanOutputHarmful(postStripContent);
+    const content = harm.harmful ? harm.safeText : postStripContent;
 
     const firstUser = userMessages.find(m => m.role === 'user');
     const title = firstUser?.content?.slice(0, 80) || 'New conversation';

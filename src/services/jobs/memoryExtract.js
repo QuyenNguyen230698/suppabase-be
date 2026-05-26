@@ -5,6 +5,7 @@
 
 import { query } from '../../db/index.js';
 import { chat } from '../aiProvider.js';
+import { generateEmbedding } from '../embeddingService.js';
 
 const BATCH = 5;
 const MIN_MESSAGES = 4;     // skip tiny chats
@@ -92,14 +93,18 @@ async function processConversation(conv) {
     const existing = await existingMemoriesSet(conv.user_id);
     const fresh = facts.filter(f => !existing.has(f.toLowerCase()));
     if (fresh.length) {
-      const values = fresh.map((_, i) =>
-        `($1, $${i + 2}, 'auto', $${fresh.length + 2})`
-      ).join(',');
-      await query(
-        `INSERT INTO user_memories (user_id, content, origin, source_conversation_id)
-         VALUES ${values}`,
-        [conv.user_id, ...fresh, conv.id]
-      );
+      // Embed each new fact so semantic recall (memoryService.buildMemoryBlock)
+      // can rank it against future questions. Skip embedding on failure — the
+      // row still inserts and falls back to recency-based recall.
+      for (const fact of fresh) {
+        let emb = null;
+        try { emb = await generateEmbedding(fact); } catch {}
+        await query(
+          `INSERT INTO user_memories (user_id, content, origin, source_conversation_id, embedding)
+           VALUES ($1, $2, 'auto', $3, $4::vector)`,
+          [conv.user_id, fact, conv.id, emb ? JSON.stringify(emb) : null]
+        );
+      }
       console.log(`[jobs.memory] ${conv.id} → +${fresh.length} memories`);
     }
   }

@@ -127,6 +127,47 @@ export async function similaritySearch(queryText, userId, documentIds, topK = TO
   return result.rows;
 }
 
+// Search across every document ever attached to this conversation, regardless
+// of what document_ids came in the current request. This is what lets the
+// model answer "what was in that PDF I uploaded yesterday?" without the
+// client having to re-send doc_ids on every turn.
+export async function similaritySearchInConversation(queryText, userId, conversationId, topK = TOP_K) {
+  if (!userId || !conversationId) return [];
+
+  let queryEmbedding;
+  try {
+    queryEmbedding = await generateEmbedding(queryText);
+  } catch (err) {
+    console.warn('[RAG] conv-search embed failed:', err.message);
+    return [];
+  }
+
+  // Resolve all doc IDs that belong to this conversation, via either
+  //   • documents.conversation_id (modern uploads), or
+  //   • message_documents → messages.conversation_id (legacy/linked)
+  const { rows } = await query(
+    `WITH conv_docs AS (
+        SELECT DISTINCT d.id
+          FROM documents d
+     LEFT JOIN message_documents md ON md.document_id = d.id
+     LEFT JOIN messages m            ON m.id = md.message_id
+         WHERE d.user_id = $2 AND d.status = 'ready'
+           AND (d.conversation_id = $3 OR m.conversation_id = $3)
+     )
+     SELECT dc.content, dc.document_id, d.name AS document_name, d.kind AS document_kind,
+            1 - (dc.embedding <=> $1::vector) AS similarity
+       FROM document_chunks dc
+       JOIN documents d ON d.id = dc.document_id
+      WHERE dc.document_id IN (SELECT id FROM conv_docs)
+        AND dc.embedding IS NOT NULL
+        AND 1 - (dc.embedding <=> $1::vector) >= $5
+   ORDER BY dc.embedding <=> $1::vector
+      LIMIT $4`,
+    [JSON.stringify(queryEmbedding), userId, conversationId, topK, SIMILARITY_THRESHOLD],
+  );
+  return rows;
+}
+
 /**
  * Build a single context string the model can quote from. Chunks are GROUPED
  * BY source file so a multi-file question ("compare A.pdf vs B.txt") gets a

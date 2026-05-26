@@ -179,6 +179,19 @@ export async function vision(args) {
   return r;
 }
 
+// Vision-by-URL — preferred path when images are already on a public-fetchable
+// origin (R2 with R2_PUBLIC_DOMAIN). Skips binary upload and uses the
+// OpenAI-compat endpoint so multiple images can be passed in one call.
+export async function visionByUrl(args) {
+  if (await shouldFallback()) {
+    throw quotaExceededError();
+  }
+  const r = await withBreaker('cloudflare', () => cf.visionFromUrl(args));
+  schedulePending(r.logId, { model: args.model }, 'cloudflare', 'vision');
+  if (r.logId) scheduleReconcile(r.logId, 'cloudflare');
+  return r;
+}
+
 // Snapshot of routing config. Now reads runtime state via providerRouter, not env.
 export async function currentMode() {
   const { getHealth } = await import('./providerRouter.js');
