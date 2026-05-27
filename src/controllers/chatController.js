@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { query } from '../db/index.js';
 import { chat as aiChat, openChatStream } from '../services/aiProvider.js';
 import { shouldFallback as quotaExceeded } from '../services/neuronsTracker.js';
+import { enqueue, subscribe, stats as queueStats } from '../services/chatQueue.js';
 import { similaritySearch, similaritySearchInConversation, buildContext, buildAttachmentManifest } from '../services/ragService.js';
 import { resolveLocale, buildSystemPrompt } from '../services/promptService.js';
 import { extractTextFromImage, describeImagesByUrl } from '../services/ocrService.js';
@@ -248,9 +249,8 @@ export async function sendMessage(req, res) {
     return await sendMessageNonStreaming(req, res, { model, messages, userId, locale, ragContext, convId: conversation_id, agentTemplateId: agent_template_id || null });
   }
 
-  // Pre-flight quota check before opening the SSE response. Once SSE headers
-  // go out we're locked into 200, so we can't return a clean 429 from inside
-  // the stream. Catching it here lets the client see a real HTTP status.
+  // Pre-flight quota check — must happen before we commit to SSE (once headers
+  // go out we're locked into HTTP 200, so errors must be SSE events).
   if (process.env.AI_PROVIDER?.toLowerCase() !== 'peb' && await quotaExceeded()) {
     return res.status(429).json({
       error: 'Daily Cloudflare neurons quota exceeded (resets at UTC 00:00)',
@@ -258,34 +258,82 @@ export async function sendMessage(req, res) {
     });
   }
 
-  const usageMeta = {};
-  await streamChat(req, res, {
+  // Enqueue the job and return job_id immediately so the client can open the
+  // SSE stream at GET /api/chat/stream/:jobId.
+  //
+  // chatCore.streamChat() expects a full Express res object (setHeader, write,
+  // end, flushHeaders). We give it a lightweight proxy that routes all output
+  // through the queue's jobWrite() so events are buffered when the subscriber
+  // hasn't arrived yet and forwarded live once it does.
+  const { jobId } = enqueue({
     userId,
-    source: 'chat',
-    model,
-    messages,
-    conversationId: conversation_id,
-    agentTemplateId: agent_template_id || null,
-    docIds,
-    ragContext,
-    locale,
-    persist: true,
-    usageMeta,
-    openUpstream: async (finalMessages, signal) => {
-      const { response, provider, fallback_reason, log_id } = await openChatStream({
-        model, messages: finalMessages, signal,
-        meta: { userId, conversationId: conversation_id, model },
+    run: async (write, signal) => {
+      const usageMeta = {};
+
+      // Proxy res: intercept SSE writes and route through queue buffer/live pipe.
+      // Headers are no-ops here — chatQueue.subscribe() sets real SSE headers.
+      let _ended = false;
+      const proxyRes = {
+        setHeader() {},
+        flushHeaders() {},
+        getHeader() { return null; },
+        get writableEnded() { return _ended; },
+        write(chunk) {
+          if (_ended) return false;
+          const str = typeof chunk === 'string' ? chunk : chunk.toString();
+          for (const line of str.split('\n')) {
+            if (!line.startsWith('data: ')) continue;
+            try { write(JSON.parse(line.slice(6))); } catch {}
+          }
+          return true;
+        },
+        end() { _ended = true; },
+        on() {},
+        once() {},
+        off() {},
+        emit() {},
+      };
+
+      // chatCore attaches req.on('close', abort) — the original POST request
+      // is already closed by the time the worker runs. Give it a proxy req
+      // whose 'close' event is wired to the queue's AbortSignal instead.
+      const { EventEmitter } = await import('events');
+      const proxyReq = Object.assign(Object.create(req), {
+        _proxyEE: new EventEmitter(),
+        on(ev, fn)   { if (ev === 'close') { this._proxyEE.on('close', fn); } else { req.on(ev, fn); } return this; },
+        once(ev, fn) { if (ev === 'close') { this._proxyEE.once('close', fn); } else { req.once(ev, fn); } return this; },
+        off(ev, fn)  { if (ev === 'close') { this._proxyEE.off('close', fn); } else { req.off(ev, fn); } return this; },
       });
-      usageMeta.provider = provider;
-      usageMeta.log_id = log_id;
-      if (fallback_reason) {
-        usageMeta.fallback_reason = fallback_reason;
-        res.setHeader('X-AI-Provider', provider);
-        res.setHeader('X-AI-Fallback-Reason', fallback_reason);
-      }
-      return response;
+      // Fire proxy close when the queue's abort signal fires (client disconnected from SSE)
+      signal.addEventListener('abort', () => proxyReq._proxyEE.emit('close'), { once: true });
+
+      await streamChat(proxyReq, proxyRes, {
+        userId,
+        source: 'chat',
+        model,
+        messages,
+        conversationId: conversation_id,
+        agentTemplateId: agent_template_id || null,
+        docIds,
+        ragContext,
+        locale,
+        persist: true,
+        usageMeta,
+        openUpstream: async (finalMessages, sig) => {
+          const { response, provider, fallback_reason, log_id } = await openChatStream({
+            model, messages: finalMessages, signal: sig || signal,
+            meta: { userId, conversationId: conversation_id, model },
+          });
+          usageMeta.provider = provider;
+          usageMeta.log_id = log_id;
+          if (fallback_reason) usageMeta.fallback_reason = fallback_reason;
+          return response;
+        },
+      });
     },
   });
+
+  return res.json({ job_id: jobId, queued: true });
 }
 
 async function sendMessageNonStreaming(req, res, { model, messages, userId, locale, ragContext, convId, agentTemplateId = null }) {
@@ -442,4 +490,18 @@ export async function deleteConversation(req, res) {
     console.error('[chat] deleteConversation error:', err.message);
     res.status(500).json({ error: 'Failed to delete conversation', code: 'ERR_DB' });
   }
+}
+
+// SSE stream endpoint — client opens this after receiving job_id from POST /api/chat
+export function streamJob(req, res) {
+  const { jobId } = req.params;
+  if (!jobId || !/^[0-9a-f]{32}$/.test(jobId)) {
+    return res.status(400).json({ error: 'Invalid job_id', code: 'ERR_INVALID_JOB' });
+  }
+  subscribe(jobId, res);
+}
+
+// Admin/client stats — how full is the queue right now
+export function getQueueStats(req, res) {
+  res.json(queueStats());
 }
