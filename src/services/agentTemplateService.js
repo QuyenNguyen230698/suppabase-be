@@ -95,7 +95,7 @@ export async function listVisible({ user, category, includeInactive = false }) {
   const whereSql = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const sql = `
     SELECT id, slug, name, description, icon, category, locale,
-           temperature, max_tokens, is_active, is_default, visibility,
+           temperature, max_tokens, model, is_active, is_default, visibility,
            org_node_id, usage_count, created_at, updated_at
     FROM agent_templates
     ${whereSql}
@@ -110,7 +110,7 @@ const ALLOWED_FIELDS = [
   'slug', 'name', 'description', 'icon', 'category',
   'system_prompt', 'rules', 'block_patterns', 'block_llm_check',
   'fallback_response', 'locale', 'temperature', 'max_tokens',
-  'is_active', 'visibility', 'org_node_id', 'allowed_tools',
+  'is_active', 'visibility', 'org_node_id', 'allowed_tools', 'model',
 ];
 
 export async function create(input, userId) {

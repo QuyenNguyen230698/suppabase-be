@@ -3,6 +3,7 @@ import { migrate, closePool } from './db/index.js';
 import { bootJobs } from './services/jobs/index.js';
 import { resumePending } from './services/usageReconciler.js';
 import { migrateFromEnv as migrateProviderEnv } from './services/providerRouter.js';
+import { startWorker as startIngestWorker } from './services/ingest/queue/worker.js';
 
 const PORT = parseInt(process.env.PORT || '3000');
 
@@ -12,6 +13,7 @@ async function main() {
     await migrateProviderEnv().catch((e) => console.warn('[server] provider env migration failed:', e.message));
     await bootJobs();
     resumePending().catch((e) => console.warn('[server] resumePending failed:', e.message));
+    startIngestWorker();
 
     const server = app.listen(PORT, () => {
       console.log(`[Server] Ready on http://localhost:${PORT}`);

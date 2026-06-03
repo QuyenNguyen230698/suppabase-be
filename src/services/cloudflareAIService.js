@@ -1,13 +1,14 @@
 import { recordUsage } from './neuronsTracker.js';
+import { MODELS } from './modelRegistry.js';
 
 const ACCOUNT_ID = process.env.CF_ACCOUNT_ID || '';
 const AI_TOKEN = process.env.CF_AI_TOKEN || '';
 // Strip any wrapping double quotes that may leak in from .env files.
 const GATEWAY_ID = (process.env.CF_AI_GATEWAY_ID || '').replace(/^"|"$/g, '');
 
-const DEFAULT_CHAT_MODEL = process.env.DEFAULT_MODEL || '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b';
-const DEFAULT_VISION_MODEL = process.env.VISION_MODEL || '@cf/meta/llama-3.2-11b-vision-instruct';
-const DEFAULT_EMBED_MODEL = process.env.EMBED_MODEL || '@cf/baai/bge-m3';
+const DEFAULT_CHAT_MODEL = MODELS.chatDefault;
+const DEFAULT_VISION_MODEL = MODELS.vision;
+const DEFAULT_EMBED_MODEL = MODELS.embed;
 
 function assertConfigured() {
   if (!ACCOUNT_ID || !AI_TOKEN) {

@@ -8,8 +8,8 @@ import { resolveLocale, buildSystemPrompt } from '../services/promptService.js';
 import { extractTextFromImage, describeImagesByUrl } from '../services/ocrService.js';
 import { fetchFromR2, r2PublicUrl } from '../services/r2Service.js';
 import { supportsVision } from '../services/modelCapabilities.js';
+import { MODELS, isAllowedChatModel, allowedChatModels } from '../services/modelRegistry.js';
 import {
-  streamChat,
   listConversationsBySource,
   getConversationWithMessages,
   deleteConversationBySource,
@@ -18,7 +18,11 @@ import {
   saveAssistantMessage,
   loadConversationMessages,
   loadConversationImageDocIds,
-} from '../services/chatCore.js';
+} from '../services/aicore/persistence.js';
+import * as AICore from '../services/aicore/index.js';
+import { createRequestContext } from '../services/aicore/context.js';
+import { QueueSink, CollectSink, ExpressSink } from '../services/aicore/sink.js';
+import { resolveAgent, runGuard } from '../services/aicore/cores/guardCore.js';
 
 // For image attachments we pull the bytes back from R2 and run the vision
 // model to OCR/describe, then splice the result into the prompt context just
@@ -77,7 +81,7 @@ export async function buildImageContext(docIds, userId, opts = {}) {
   return parts.length ? parts.join('\n\n---\n\n') : '';
 }
 
-const DEFAULT_PUBLIC_MODEL = process.env.DEFAULT_MODEL || '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b';
+const DEFAULT_PUBLIC_MODEL = MODELS.chatDefault;
 
 /** Public chat — stateless, no auth, no DB. Used by embedded widget. */
 export async function publicChat(req, res) {
@@ -118,7 +122,7 @@ export async function publicChat(req, res) {
   }
 
   const publicUsageMeta = {};
-  await streamChat(req, res, {
+  const ctx = createRequestContext({
     source: 'public',
     model: chatModel,
     messages: userMessages,
@@ -135,6 +139,7 @@ export async function publicChat(req, res) {
       return response;
     },
   });
+  await AICore.run(ctx, new ExpressSink(res));
 }
 
 /** Authenticated chat with persistence + optional RAG. */
@@ -144,6 +149,15 @@ export async function sendMessage(req, res) {
 
   if (!model) {
     return res.status(400).json({ error: 'model is required', code: 'ERR_MESSAGES_REQUIRED' });
+  }
+  // Allow-list guard — reject models the FE shouldn't offer (trimmed list), so a
+  // hand-crafted request or stale client can't run a removed/unsupported model.
+  if (!isAllowedChatModel(model)) {
+    return res.status(400).json({
+      error: `Model not allowed: ${model}`,
+      code: 'ERR_MODEL_NOT_ALLOWED',
+      allowed: allowedChatModels(),
+    });
   }
 
   const userId = req.user.id;
@@ -258,59 +272,38 @@ export async function sendMessage(req, res) {
     });
   }
 
+  // Pre-flight guard — the chat flow runs through the queue worker, which can't
+  // return an HTTP status once enqueued. So we run GuardCore HERE and return a
+  // real 422/429 before enqueuing. The orchestrator skips re-checking via
+  // guardAlreadyChecked.
+  const userMessagesForGuard = messages.filter((m) => m.role !== 'system');
+  const guardAgent = await resolveAgent({ agentTemplateId: agent_template_id || null, conversationId: conversation_id });
+  const guard = await runGuard({ userMessages: userMessagesForGuard, agent: guardAgent, userId, locale });
+  if (!guard.ok) return res.status(guard.status).json(guard.body);
+
+  // Locked-model agents win: if the resolved agent pins a model, it overrides
+  // whatever the client sent (the FE locks the selector, this enforces it).
+  const effectiveModel = (guardAgent?.model && isAllowedChatModel(guardAgent.model))
+    ? guardAgent.model
+    : model;
+
   // Enqueue the job and return job_id immediately so the client can open the
-  // SSE stream at GET /api/chat/stream/:jobId.
-  //
-  // chatCore.streamChat() expects a full Express res object (setHeader, write,
-  // end, flushHeaders). We give it a lightweight proxy that routes all output
-  // through the queue's jobWrite() so events are buffered when the subscriber
-  // hasn't arrived yet and forwarded live once it does.
+  // SSE stream at GET /api/chat/stream/:jobId. AICore writes through QueueSink,
+  // which routes events to the queue's write() (buffered until the subscriber
+  // attaches, then forwarded live).
   const { jobId } = enqueue({
     userId,
     run: async (write, signal) => {
       const usageMeta = {};
+      const sink = new QueueSink(write);
+      // The original POST request is already closed by the time the worker runs;
+      // the queue's AbortSignal fires on client SSE disconnect → tell the sink.
+      signal.addEventListener('abort', () => sink.triggerClose(), { once: true });
 
-      // Proxy res: intercept SSE writes and route through queue buffer/live pipe.
-      // Headers are no-ops here — chatQueue.subscribe() sets real SSE headers.
-      let _ended = false;
-      const proxyRes = {
-        setHeader() {},
-        flushHeaders() {},
-        getHeader() { return null; },
-        get writableEnded() { return _ended; },
-        write(chunk) {
-          if (_ended) return false;
-          const str = typeof chunk === 'string' ? chunk : chunk.toString();
-          for (const line of str.split('\n')) {
-            if (!line.startsWith('data: ')) continue;
-            try { write(JSON.parse(line.slice(6))); } catch {}
-          }
-          return true;
-        },
-        end() { _ended = true; },
-        on() {},
-        once() {},
-        off() {},
-        emit() {},
-      };
-
-      // chatCore attaches req.on('close', abort) — the original POST request
-      // is already closed by the time the worker runs. Give it a proxy req
-      // whose 'close' event is wired to the queue's AbortSignal instead.
-      const { EventEmitter } = await import('events');
-      const proxyReq = Object.assign(Object.create(req), {
-        _proxyEE: new EventEmitter(),
-        on(ev, fn)   { if (ev === 'close') { this._proxyEE.on('close', fn); } else { req.on(ev, fn); } return this; },
-        once(ev, fn) { if (ev === 'close') { this._proxyEE.once('close', fn); } else { req.once(ev, fn); } return this; },
-        off(ev, fn)  { if (ev === 'close') { this._proxyEE.off('close', fn); } else { req.off(ev, fn); } return this; },
-      });
-      // Fire proxy close when the queue's abort signal fires (client disconnected from SSE)
-      signal.addEventListener('abort', () => proxyReq._proxyEE.emit('close'), { once: true });
-
-      await streamChat(proxyReq, proxyRes, {
+      const ctx = createRequestContext({
         userId,
         source: 'chat',
-        model,
+        model: effectiveModel,
         messages,
         conversationId: conversation_id,
         agentTemplateId: agent_template_id || null,
@@ -319,10 +312,11 @@ export async function sendMessage(req, res) {
         locale,
         persist: true,
         usageMeta,
+        guardAlreadyChecked: true,
         openUpstream: async (finalMessages, sig) => {
           const { response, provider, fallback_reason, log_id } = await openChatStream({
-            model, messages: finalMessages, signal: sig || signal,
-            meta: { userId, conversationId: conversation_id, model },
+            model: effectiveModel, messages: finalMessages, signal: sig || signal,
+            meta: { userId, conversationId: conversation_id, model: effectiveModel },
           });
           usageMeta.provider = provider;
           usageMeta.log_id = log_id;
@@ -330,6 +324,7 @@ export async function sendMessage(req, res) {
           return response;
         },
       });
+      await AICore.run(ctx, sink);
     },
   });
 
@@ -340,40 +335,15 @@ async function sendMessageNonStreaming(req, res, { model, messages, userId, loca
   try {
     const userMessages = messages.filter(m => m.role !== 'system');
 
-    // Resolve agent + guardrail (mirrors streamChat pipeline)
-    const { resolveForRequest: resolveAgent, buildAgentSection } = await import('../services/agentTemplateService.js');
-    const { checkUserMessage, scanHistoryForPriming } = await import('../services/guardService.js');
-    const { buildRefusal } = await import('../services/refusalMessage.js');
-    const agent = await resolveAgent({ agentTemplateId, conversationId: convId }).catch(() => null);
+    // Resolve agent + run the shared GuardCore (same verdict shape as the
+    // streaming pipeline) so non-stream and stream block identically.
+    const { buildAgentSection } = await import('../services/agentTemplateService.js');
+    const { logHarmfulOutput, scanOutputHarmful } = await import('../services/guardService.js');
+    const agent = await resolveAgent({ agentTemplateId, conversationId: convId });
 
     const lastUserMsg = [...userMessages].reverse().find(m => m.role === 'user');
-    if (lastUserMsg?.content) {
-      const histVerdict = await scanHistoryForPriming(userMessages, { userId });
-      if (!histVerdict.safe) {
-        return res.status(422).json({
-          error: buildRefusal({ locale, category: histVerdict.category, layer: histVerdict.layer, agentFallback: agent?.fallback_response }),
-          code: 'ERR_GUARDRAIL_BLOCKED',
-          layer: histVerdict.layer,
-          category: histVerdict.category,
-          severity: histVerdict.severity,
-        });
-      }
-      const verdict = await checkUserMessage(lastUserMsg.content, agent, { userId });
-      if (!verdict.safe) {
-        const status = verdict.status || 422;
-        const code = verdict.layer === 'L7_rate_limit' ? 'ERR_RATE_LIMITED' : 'ERR_GUARDRAIL_BLOCKED';
-        return res.status(status).json({
-          error: buildRefusal({ locale, category: verdict.category, layer: verdict.layer, agentFallback: agent?.fallback_response }),
-          code,
-          layer: verdict.layer,
-          category: verdict.category,
-          severity: verdict.severity,
-          score: verdict.score,
-          block_until: verdict.block_until,
-          escalation: verdict.escalation,
-        });
-      }
-    }
+    const guard = await runGuard({ userMessages, agent, userId, locale });
+    if (!guard.ok) return res.status(guard.status).json(guard.body);
 
     // Build system prompt with agent section
     const agentSection = agent ? buildAgentSection(agent) : '';
@@ -398,7 +368,6 @@ async function sendMessageNonStreaming(req, res, { model, messages, userId, loca
     }
 
     // L6 output scan — replace harmful output with refusal before persist/return.
-    const { scanOutputHarmful, logHarmfulOutput } = await import('../services/guardService.js');
     const harm = scanOutputHarmful(postStripContent);
     const content = harm.harmful ? harm.safeText : postStripContent;
 

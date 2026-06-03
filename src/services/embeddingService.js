@@ -1,6 +1,7 @@
 import { embed } from './aiProvider.js';
+import { MODELS } from './modelRegistry.js';
 
-export const EMBED_MODEL_TAG = process.env.EMBED_MODEL || '@cf/baai/bge-m3';
+export const EMBED_MODEL_TAG = MODELS.embed;
 const CHUNK_SIZE = 500;
 const CHUNK_OVERLAP = 50;
 

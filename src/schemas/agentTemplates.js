@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isAllowedChatModel } from '../services/modelRegistry.js';
 
 const SLUG_RE = /^[a-z0-9-]{2,64}$/;
 const ICON_VALUES = ['sparkles', 'file-text', 'pen-tool', 'code', 'bot'];
@@ -43,6 +44,11 @@ const baseFields = {
   visibility:        z.enum(VISIBILITY).optional(),
   org_node_id:       z.string().uuid().nullable().optional(),
   allowed_tools:     z.array(z.enum(TOOLS)).max(10).optional(),
+  // Optional locked model. null/'' = let the user choose. A non-empty value
+  // must be in the chat allow-list (modelRegistry), so an agent can't pin a
+  // removed/unsupported model.
+  model: z.string().max(200).nullable().optional()
+    .refine((m) => !m || isAllowedChatModel(m), { message: 'model must be an allowed chat model or null' }),
 };
 
 export const createAgentTemplateBody = z.object({

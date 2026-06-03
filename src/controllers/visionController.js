@@ -3,8 +3,9 @@ import { query } from '../db/index.js';
 import { chat as aiChat, openChatStream } from '../services/aiProvider.js';
 import { extractTextFromImage } from '../services/ocrService.js';
 import { scheduleReconcile } from '../services/usageReconciler.js';
+import { MODELS } from '../services/modelRegistry.js';
 
-const VISION_MODEL = process.env.VISION_MODEL || '@cf/meta/llama-3.2-11b-vision-instruct';
+const VISION_MODEL = MODELS.vision;
 const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'Suppabase';
 
 const SYSTEM_PROMPT_BASE =

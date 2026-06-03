@@ -14,6 +14,28 @@
 // truth for live quota decisions — those use the rolling window directly.
 
 import { query } from '../db/index.js';
+import { fetchNeuronsUsage, isConfigured as analyticsConfigured } from './cfAnalyticsService.js';
+
+// Authoritative CF neuron usage (GraphQL Analytics), cached separately. When
+// available it's the source of truth for the quota number; otherwise we fall
+// back to the estimated sum from ai_usage_log (the legacy behaviour).
+let cfCache = { at: 0, data: null, ok: false };
+const CF_CACHE_TTL_MS = 60 * 1000;
+
+async function loadCfUsage(force = false) {
+  if (!analyticsConfigured()) return { ok: false, data: null };
+  if (!force && cfCache.data && (Date.now() - cfCache.at) < CF_CACHE_TTL_MS) return cfCache;
+  try {
+    const data = await fetchNeuronsUsage(); // rolling 24h
+    cfCache = { at: Date.now(), data, ok: true };
+  } catch (err) {
+    // Forbidden (token lacks Account Analytics:Read) or transient — fall back
+    // silently to the estimate. Log once per TTL to avoid spam.
+    if (cfCache.ok || !cfCache.at) console.warn('[neurons] CF analytics unavailable, using estimate:', err.code || err.message);
+    cfCache = { at: Date.now(), data: null, ok: false };
+  }
+  return cfCache;
+}
 
 const DAILY_LIMIT = parseFloat(process.env.CF_NEURONS_DAILY_LIMIT || '9500');
 const FALLBACK_THRESHOLD = parseFloat(process.env.CF_NEURONS_FALLBACK_THRESHOLD || '9500');
@@ -159,27 +181,64 @@ function estimateResetTimes(oldestIso, newestIso) {
   };
 }
 
-export async function getToday() {
-  const c = await loadRolling();
-  gcPending();
-  const effective = c.used + pendingSum;
-  const remaining = Math.max(0, DAILY_LIMIT - effective);
-  const reset = estimateResetTimes(c.oldestInWindow, c.newestInWindow);
-  const isOverQuota = effective >= FALLBACK_THRESHOLD;
-  return {
-    // Window kind — used by FE to decide tooltip wording.
-    window: 'rolling_24h',
+// Next UTC midnight — when CF's free-tier daily quota resets.
+function nextUtcMidnight() {
+  const d = new Date();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0, 0));
+}
 
-    // Quota numbers (rolling 24h).
-    neurons_used:       round4(c.used),
+export async function getToday() {
+  const [c, cf] = await Promise.all([loadRolling(), loadCfUsage()]);
+  gcPending();
+
+  // Prefer CF's authoritative number when the analytics token is available;
+  // otherwise use the ai_usage_log estimate. `pending` reservations still count
+  // on top so in-flight requests don't slip past the cap.
+  const source = cf.ok ? 'cloudflare_gateway' : 'estimated_logs';
+  const baseUsed = cf.ok ? cf.data.totalNeurons : c.used;
+  const effective = baseUsed + pendingSum;
+  const remaining = Math.max(0, DAILY_LIMIT - effective);
+  const isOverQuota = effective >= FALLBACK_THRESHOLD;
+
+  // Window + reset semantics differ by source:
+  //   CF gateway → UTC calendar day, resets at 00:00 UTC (matches CF dashboard).
+  //   estimate   → rolling 24h (legacy), reset estimated from oldest/newest row.
+  let windowKind, reset;
+  if (cf.ok) {
+    const resetAt = nextUtcMidnight();
+    windowKind = 'utc_day';
+    reset = {
+      next_partial_reset: resetAt.toISOString(),
+      next_full_reset:    resetAt.toISOString(),
+      seconds_to_partial_reset: Math.max(0, Math.floor((resetAt.getTime() - Date.now()) / 1000)),
+      seconds_to_full_reset:    Math.max(0, Math.floor((resetAt.getTime() - Date.now()) / 1000)),
+    };
+  } else {
+    windowKind = 'rolling_24h';
+    reset = estimateResetTimes(c.oldestInWindow, c.newestInWindow);
+  }
+
+  return {
+    window: windowKind,
+    source,
+
+    // Quota numbers.
+    neurons_used:       round4(baseUsed),
     neurons_pending:    round4(pendingSum),
     neurons_effective:  round4(effective),
     neurons_limit:      DAILY_LIMIT,
     neurons_remaining:  round4(remaining),
     percent_used:       DAILY_LIMIT ? round2((effective / DAILY_LIMIT) * 100) : 0,
 
+    // Token usage (only from CF analytics; null on estimate).
+    tokens_in:  cf.ok ? cf.data.totalInputTokens : null,
+    tokens_out: cf.ok ? cf.data.totalOutputTokens : null,
+
+    // Breakdown (CF only).
+    by_model: cf.ok ? cf.data.byModel : null,
+
     // Counters.
-    request_count:  c.requests,
+    request_count:  cf.ok ? cf.data.requests : c.requests,
     fallback_count: c.fallbacks,
     pending_count:  pending.size,
 
@@ -198,9 +257,10 @@ export async function getToday() {
 }
 
 export async function shouldFallback() {
-  const c = await loadRolling();
+  const [c, cf] = await Promise.all([loadRolling(), loadCfUsage()]);
   gcPending();
-  return (c.used + pendingSum) >= FALLBACK_THRESHOLD;
+  const baseUsed = cf.ok ? cf.data.totalNeurons : c.used;
+  return (baseUsed + pendingSum) >= FALLBACK_THRESHOLD;
 }
 
 // Reserve an optimistic neurons estimate for an in-flight CF request. The

@@ -3,13 +3,15 @@ import { resolveLocale, buildSystemPrompt } from '../services/promptService.js';
 import { similaritySearch, similaritySearchInConversation, buildContext, buildAttachmentManifest } from '../services/ragService.js';
 import { fetchFromR2 } from '../services/r2Service.js';
 import {
-  streamChat,
   listConversationsBySource,
   getConversationWithMessages,
   deleteConversationBySource,
   loadConversationMessages,
   loadConversationImageDocIds,
-} from '../services/chatCore.js';
+} from '../services/aicore/persistence.js';
+import * as AICore from '../services/aicore/index.js';
+import { createRequestContext } from '../services/aicore/context.js';
+import { ExpressSink } from '../services/aicore/sink.js';
 import { buildImageContext } from './chatController.js';
 
 const PEB_API_URL = 'https://supabase.pebsteel.com/functions/v1/ollama-proxy';
@@ -197,9 +199,10 @@ export async function pebChat(req, res) {
     return await pebNonStreaming(req, res, { messages, pebModel, userId, locale, imageFile: finalImageFile, conversationId: conversation_id, ragContext });
   }
 
-  // Streaming via unified chatCore — pass ragContext through so the system
-  // prompt is built with image/RAG context (chatCore.streamChat appends it).
-  await streamChat(req, res, {
+  // Streaming via unified AICore — pass ragContext through so the system prompt
+  // is built with image/RAG context (ContextCore appends it). Guard runs inside
+  // the pipeline for the pro flow (synchronous res, no queue).
+  const ctx = createRequestContext({
     userId,
     source: 'pro',
     model: pebModel,
@@ -216,6 +219,7 @@ export async function pebChat(req, res) {
       return fetch(PEB_API_URL, buildUpstreamFetchOpts(payload, finalImageFile, signal));
     },
   });
+  await AICore.run(ctx, new ExpressSink(res));
 }
 
 async function pebNonStreaming(req, res, { messages, pebModel, userId, locale, imageFile, conversationId, ragContext = '' }) {

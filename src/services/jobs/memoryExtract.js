@@ -6,11 +6,12 @@
 import { query } from '../../db/index.js';
 import { chat } from '../aiProvider.js';
 import { generateEmbedding } from '../embeddingService.js';
+import { MODELS } from '../modelRegistry.js';
 
 const BATCH = 5;
 const MIN_MESSAGES = 4;     // skip tiny chats
 const MAX_FACTS    = 6;     // cap memories per scan
-const MODEL = process.env.MEMORY_MODEL || process.env.DEFAULT_MODEL || '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b';
+const MODEL = process.env.MEMORY_MODEL || MODELS.chatDefault;
 
 const SYSTEM = `You extract durable user preferences and identity facts from a chat.
 Return a JSON array of short bullets, each ≤ 120 chars, of the user's:

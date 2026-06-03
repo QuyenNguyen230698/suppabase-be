@@ -42,6 +42,9 @@ function withTimeout(promise, ms) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(to));
 }
 
+// DEPRECATED (PR3/PR4): the durable ingest worker (services/ingest/queue) now
+// owns concurrency + retry. This in-process queue is no longer wired into the
+// upload path. Kept only so any remaining ad-hoc caller keeps working.
 export async function runExtract(fn) {
   await acquire();
   try {

@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { query } from '../db/index.js';
+import { MODELS } from '../services/modelRegistry.js';
 
 const EXPIRY_OPTIONS = {
   '1h': 60 * 60 * 1000,
@@ -67,7 +68,7 @@ export async function getTokenCurl(req, res) {
   if (!result.rows.length) return res.status(404).json({ error: 'Token not found' });
 
   const host = `${req.protocol}://${req.get('host')}`;
-  const defaultModel = process.env.DEFAULT_MODEL || 'deepseek-r1:7b';
+  const defaultModel = process.env.DEFAULT_MODEL || MODELS.chatDefault;
   const assistantName = process.env.ASSISTANT_NAME || 'Suppabase';
   const systemPrompt = `Bạn là ${assistantName}, kỹ sư AI nhiệt tình với chuyên môn sâu về lập trình và phân tích kỹ thuật.
 

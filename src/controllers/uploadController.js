@@ -1,37 +1,8 @@
 import { query } from '../db/index.js';
-import { extractText } from '../services/extractors/index.js';
-import { runExtract } from '../services/extractorQueue.js';
-import { storeDocument } from '../services/ragService.js';
 import {
   uploadToR2, deleteFromR2, r2KeyForDocument, r2PublicUrl,
 } from '../services/r2Service.js';
-
-// Process an attachment after the R2 upload + DB row are in place.
-// - 'image': nothing to index now; vision will read R2 buffer at chat time.
-// - 'pdf' / 'document' / 'code' / 'text': extract text and feed RAG.
-async function processAttachment(doc, buffer) {
-  if (doc.kind === 'image') {
-    await query(`UPDATE documents SET status='ready' WHERE id=$1`, [doc.id]);
-    return;
-  }
-  try {
-    const text = await runExtract(() => extractText(buffer, doc.type, doc.kind));
-    if (!text || !text.trim()) {
-      await query(
-        `UPDATE documents SET status='error', error_msg='No text could be extracted' WHERE id=$1`,
-        [doc.id],
-      );
-      return;
-    }
-    await storeDocument(doc.id, text);   // sets status='ready' inside
-  } catch (err) {
-    console.error(`[upload] processing failed for doc ${doc.id}:`, err.message);
-    await query(
-      `UPDATE documents SET status='error', error_msg=$1 WHERE id=$2`,
-      [err.message.slice(0, 500), doc.id],
-    );
-  }
-}
+import { enqueueDocument } from '../services/ingest/ingestionCore.js';
 
 export async function uploadFile(req, res) {
   if (!req.file) return res.status(400).json({ error: 'No file provided', code: 'ERR_NO_FILE' });
@@ -78,8 +49,18 @@ export async function uploadFile(req, res) {
     [r2Key, publicUrl, docId],
   );
 
-  // 3. Async post-processing (text extraction / RAG).
-  setImmediate(() => processAttachment({ id: docId, kind, type: mimetype }, buffer));
+  // 3. Route + enqueue durable ingest job. The background worker
+  //    (services/ingest/queue/worker.js) picks it up — survives restarts and
+  //    retries with backoff, unlike the old in-process setImmediate path.
+  try {
+    await enqueueDocument({ documentId: docId, kind, mimetype });
+  } catch (err) {
+    console.error(`[upload] enqueue failed for doc ${docId}:`, err.message);
+    await query(
+      `UPDATE documents SET status='error', error_msg=$1 WHERE id=$2`,
+      [`enqueue failed: ${err.message}`.slice(0, 500), docId],
+    );
+  }
 
   res.status(201).json({
     document_id: docId,

@@ -4,6 +4,9 @@ import { generateEmbedding, chunkText, EMBED_MODEL_TAG } from './embeddingServic
 const BATCH_SIZE = 50;
 const TOP_K = 5;
 
+// DEPRECATED (PR4): the ingest worker now uses cores/codeTextCore + embedGuard
+// instead of this path. Kept for ad-hoc scripts / re-embed tooling. New code
+// should not call this — it does not validate embeddings or write code metadata.
 export async function storeDocument(documentId, fullText) {
   const chunks = chunkText(fullText);
   if (chunks.length === 0) {

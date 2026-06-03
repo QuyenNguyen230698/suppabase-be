@@ -2,14 +2,12 @@
 //   - whether to allow image attachments for a chat request
 //   - whether OCR is needed (vision-native models can see images directly)
 //
-// Vision-capable models: keep this list aligned with what the upstream
-// provider actually supports. Cloudflare's Llama 3.2 vision + Llama 4 Scout
-// are multimodal; the others in our default catalog are text-only.
+// The canonical vision-model list lives in modelRegistry.VISION_MODELS so this
+// module and the vision pipeline never drift. Cloudflare's Llama 4 Scout (the
+// current default) and Llama 3.2 vision (legacy) are multimodal; the others in
+// our default catalog are text-only.
 
-const VISION_MODELS = new Set([
-  '@cf/meta/llama-3.2-11b-vision-instruct',
-  '@cf/meta/llama-4-scout-17b-16e-instruct',
-]);
+import { VISION_MODELS } from './modelRegistry.js';
 
 export function supportsVision(model) {
   if (!model) return false;

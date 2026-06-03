@@ -31,6 +31,8 @@ import aiSettingsRoutes from './routes/aiSettings.js';
 import { publicRouter as agentTemplatesPublicRoutes, adminRouter as agentTemplatesAdminRoutes } from './routes/agentTemplates.js';
 import qaAuditRoutes from './routes/qaAudit.js';
 import { userRouter as ratingUserRoutes, adminRouter as ratingAdminRoutes } from './routes/rating.js';
+import metricsRoutes from './routes/metrics.js';
+import searchRoutes from './routes/search.js';
 
 const app = express();
 app.set('etag', 'strong');   // strong ETag — match exact body bytes
@@ -166,6 +168,12 @@ app.use('/api/chat', flexAuth, applyUserLocale, chatLimiter, chatRoutes);
 app.use('/api/upload', flexAuth, applyUserLocale, uploadRoutes);
 app.use('/api/documents', flexAuth, applyUserLocale, documentRoutes);
 
+// Knowledge-base search (Search Core) — document content + invoices. Mounted
+// before the cross-source conversations router so /api/search/documents and
+// /api/search/invoices resolve here (conversations owns /search/conversations
+// + /search/messages).
+app.use('/api/search', authMiddleware, applyUserLocale, searchRoutes);
+
 // Cross-source conversation ops + search + tags
 app.use('/api', authMiddleware, applyUserLocale, conversationsRoutes);
 app.use('/api/projects', authMiddleware, applyUserLocale, projectsRoutes); // guard per-route trong projects.js
@@ -198,6 +206,10 @@ app.use('/api/admin/qa-audit', authMiddleware, applyUserLocale, qaAuditRoutes);
 // Rating — user thumb up/down + admin quality dashboard
 app.use('/api/messages', authMiddleware, applyUserLocale, ratingUserRoutes);
 app.use('/api/admin/ratings', authMiddleware, applyUserLocale, ratingAdminRoutes);
+
+// Prometheus scrape endpoint for the ingestion pipeline (public, no auth —
+// scraped by the monitoring server; expose at the network/ingress layer only).
+app.use('/metrics', metricsRoutes);
 
 // Health: db ping + version + uptime
 app.get('/api/health', async (req, res) => {

@@ -1,5 +1,6 @@
 import { query } from '../../db/index.js';
 import { chat } from '../aiProvider.js';
+import { MODELS } from '../modelRegistry.js';
 
 // Auto-generate `conversations.summary` for chats that:
 //   • have ≥ MIN_MESSAGES messages
@@ -11,7 +12,7 @@ import { chat } from '../aiProvider.js';
 
 const BATCH = 5;
 const MIN_MESSAGES = parseInt(process.env.SUMMARY_MIN_MESSAGES || '6', 10);
-const SUMMARY_MODEL = process.env.SUMMARY_MODEL || process.env.DEFAULT_MODEL || '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b';
+const SUMMARY_MODEL = process.env.SUMMARY_MODEL || MODELS.chatDefault;
 
 async function pickCandidates() {
   // Pick conversations that:

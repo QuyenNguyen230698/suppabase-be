@@ -6,7 +6,24 @@ export async function getAiUsage(req, res) {
   try {
     const days = Math.min(parseInt(req.query.days, 10) || 7, 90);
     const [today, history, mode] = await Promise.all([getToday(), getHistory(days), currentMode()]);
-    res.json({ today, history, mode });
+
+    // Surface CF's authoritative numbers as a dedicated block so the FE can show
+    // "real neurons / 10000" clearly and badge when it's only an estimate.
+    const cloudflare = {
+      source: today.source,                       // 'cloudflare_gateway' | 'estimated_logs'
+      authoritative: today.source === 'cloudflare_gateway',
+      neurons_used: today.neurons_used,
+      neurons_limit: today.neurons_limit,
+      neurons_remaining: today.neurons_remaining,
+      percent_used: today.percent_used,
+      tokens_in: today.tokens_in,
+      tokens_out: today.tokens_out,
+      by_model: today.by_model,
+      window: today.window,                       // 'utc_day' | 'rolling_24h'
+      resets_at: today.next_full_reset,           // 00:00 UTC next day when CF-sourced
+    };
+
+    res.json({ today, history, mode, cloudflare });
   } catch (err) {
     console.error('[aiUsage] error:', err.message);
     res.status(500).json({ error: 'Failed to load AI usage', code: 'ERR_DB' });
