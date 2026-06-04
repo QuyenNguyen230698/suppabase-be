@@ -97,7 +97,7 @@ export async function pebChat(req, res) {
     try { body = JSON.parse(req.body.payload); } catch { body = req.body; }
   }
 
-  const { model, messages: clientMessages, conversation_id, document_ids } = body;
+  const { model, messages: clientMessages, conversation_id, document_ids, agent_template_id } = body;
   const streamRaw = body.stream;
   const stream = streamRaw === false || streamRaw === 'false' ? false : true;
   const imageFile = req.file || null;
@@ -208,6 +208,7 @@ export async function pebChat(req, res) {
     model: pebModel,
     messages,
     conversationId: conversation_id,
+    agentTemplateId: agent_template_id || null,
     docIds,
     ragContext,
     locale,
