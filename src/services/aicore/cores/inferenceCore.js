@@ -15,6 +15,39 @@ import { createStreamParser, chunkifyForReplay } from '../streamParser.js';
 import { finalizeStream } from './outputCore.js';
 import * as cacheCore from './cacheCore.js';
 
+// Hard, canned replies shown to the user when Cloudflare can't serve the
+// request and we are NOT falling back to PEB (auto-fallback removed by design).
+// These are emitted as a normal assistant turn (chunk + done) so the user sees
+// a clear message in the thread instead of a red error banner.
+const HARD_REPLIES = {
+  ERR_QUOTA_EXCEEDED:
+    'Hệ thống đã dùng hết hạn mức AI miễn phí trong hôm nay (Cloudflare Workers AI). ' +
+    'Hạn mức sẽ tự đặt lại vào 00:00 UTC. Vui lòng thử lại sau, hoặc dùng Pro Plan nếu bạn được cấp quyền.',
+  ERR_CF_UNAVAILABLE:
+    'Dịch vụ AI (Cloudflare Workers AI) hiện tạm thời không khả dụng. ' +
+    'Vui lòng thử lại sau ít phút. Nếu bạn được cấp quyền Pro Plan, có thể chuyển sang Pro Plan để tiếp tục.',
+};
+
+// Emit a fixed assistant reply over the sink and persist it like a normal turn.
+async function emitHardReply(ctx, sink, code) {
+  const content = HARD_REPLIES[code] || HARD_REPLIES.ERR_CF_UNAVAILABLE;
+  for (const c of chunkifyForReplay(content)) sink.emit({ type: 'chunk', content: c });
+  sink.emit({
+    type: 'usage', model: ctx.model,
+    provider: 'system', upstream_error: code,
+    prompt_tokens: 0, completion_tokens: 0,
+  });
+  if (ctx.persist && ctx.convId) {
+    await saveAssistantMessage({
+      convId: ctx.convId, content, reasoning: null,
+      model: ctx.model, tokensIn: 0, tokensOut: 0,
+      provider: 'system', logId: null, fallbackReason: code,
+      agentTemplateId: ctx.agent?.id || null,
+    }).catch((e) => console.warn('[aicore] hard-reply persist failed:', e.message));
+  }
+  sink.end();
+}
+
 // ── Tool branch ──────────────────────────────────────────────────
 export async function runTools(ctx, sink, signal) {
   const { model, finalMessages, tools, agent, userId, convId, docIds, locale, persist } = ctx;
@@ -74,6 +107,11 @@ export async function runTools(ctx, sink, signal) {
   } catch (err) {
     if (err.name === 'AbortError') return;
     console.error('[aicore] tool loop error:', err.message);
+    // Cloudflare quota/outage inside the tool loop → hard reply, no PEB fallback.
+    if (err.code === 'ERR_QUOTA_EXCEEDED' || err.code === 'ERR_CF_UNAVAILABLE') {
+      await emitHardReply(ctx, sink, err.code);
+      return;
+    }
     sink.emit({ type: 'error', error: 'Tool execution failed', code: 'ERR_TOOL_LOOP' });
     sink.end();
   }
@@ -89,14 +127,16 @@ export async function runStream(ctx, sink, controller) {
   } catch (err) {
     if (err.name === 'AbortError') return;
     console.error('[aicore] upstream open error:', err.message);
-    if (err.code === 'ERR_QUOTA_EXCEEDED') {
-      sink.emit({ type: 'error', error: err.message, code: 'ERR_QUOTA_EXCEEDED', status: 429 });
-      sink.end();
+    // Quota exhausted or Cloudflare unavailable → no PEB auto-fallback. Prefer a
+    // fresh-enough cached answer if we have one, otherwise return a hard,
+    // user-facing message (shown as a normal assistant reply, not an error).
+    if (err.code === 'ERR_QUOTA_EXCEEDED' || err.code === 'ERR_CF_UNAVAILABLE') {
+      if (await cacheCore.serveStale(ctx, sink, `open_error:${err.code}`)) return;
+      await emitHardReply(ctx, sink, err.code);
       return;
     }
     if (await cacheCore.serveStale(ctx, sink, `open_error:${err.code || err.message}`)) return;
-    sink.emit({ type: 'error', error: 'Upstream unavailable', code: 'ERR_UPSTREAM' });
-    sink.end();
+    await emitHardReply(ctx, sink, 'ERR_CF_UNAVAILABLE');
     return;
   }
 

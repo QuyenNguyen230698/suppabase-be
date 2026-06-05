@@ -12,12 +12,27 @@ import { recordPending, scheduleReconcile } from './usageReconciler.js';
 import { withBreaker, isOpen as breakerOpen } from './circuitBreaker.js';
 import { resolveProvider } from './providerRouter.js';
 
-const AUTO_FALLBACK = (process.env.AI_AUTO_FALLBACK ?? 'true') !== 'false';
+// NOTE: Auto-fallback to PEB on the normal /api/chat flow has been removed by
+// design. When Cloudflare is unavailable (quota exhausted, transient error, or
+// circuit breaker open) we DO NOT silently switch to PEB — instead we surface a
+// hard message to the user (see inferenceCore). PEB is only used when an admin
+// explicitly routes there (rule 'peb_first' / manual override) or via Pro Plan
+// (/api/chat/peb). The AI_AUTO_FALLBACK env flag is therefore no longer honored.
 
 function quotaExceededError() {
   const err = new Error('Daily Cloudflare neurons quota exceeded (resets at UTC 00:00)');
   err.code = 'ERR_QUOTA_EXCEEDED';
   err.status = 429;
+  return err;
+}
+
+// Cloudflare is down/unreachable (transient upstream error or breaker open) and
+// we are NOT falling back to PEB. inferenceCore turns this into a hard reply.
+function cloudflareUnavailableError(cause) {
+  const err = new Error('Cloudflare AI is temporarily unavailable');
+  err.code = 'ERR_CF_UNAVAILABLE';
+  err.status = 503;
+  if (cause) err.cause = cause;
   return err;
 }
 
@@ -60,18 +75,15 @@ export async function chat({ messages, model, signal, options, meta }) {
     return { ...r, provider: 'peb', fallback_reason: 'router_decision' };
   }
 
-  // CF path — still hard-block on quota (router 'cf_first' lets caller override
-  // the auto-fallback but never bypasses the actual quota guard).
+  // CF path — hard-block on quota. No PEB fallback on the normal chat flow.
   if (await shouldFallback()) {
     throw quotaExceededError();
   }
 
-  // Pre-emptive check: if CF breaker is OPEN, transient infra fallback to PEB
-  // (this is a CF outage, not a quota issue — PEB is the safety net here).
-  if (AUTO_FALLBACK && breakerOpen('cloudflare') && peb.isConfigured()) {
-    const r = await peb.chat({ messages, signal, options });
-    recordUsage({ fallback: true }).catch(() => {});
-    return { ...r, provider: 'peb', fallback_reason: 'breaker_open' };
+  // Breaker open = CF outage. Previously we fell back to PEB here; now we surface
+  // a hard "unavailable" instead.
+  if (breakerOpen('cloudflare')) {
+    throw cloudflareUnavailableError();
   }
 
   const tempId = `tmp_${crypto.randomBytes(8).toString('hex')}`;
@@ -95,16 +107,9 @@ export async function chat({ messages, model, signal, options, meta }) {
   } catch (err) {
     // Release whichever id is currently holding the reservation.
     releasePending(realLogId || tempId);
-    if (AUTO_FALLBACK && isTransient(err) && peb.isConfigured()) {
-      console.warn(`[aiProvider] Cloudflare chat failed (${err.code}), falling back to PEB`);
-      const r = await peb.chat({ messages, signal, options });
-      recordUsage({ fallback: true }).catch(() => {});
-      return {
-        ...r,
-        provider: 'peb',
-        fallback_reason: err.code === 'ERR_BREAKER_OPEN' ? 'breaker_open' : 'cloudflare_error',
-      };
-    }
+    if (err.name === 'AbortError') throw err;
+    // CF transient failure → no PEB fallback; report unavailable.
+    if (isTransient(err)) throw cloudflareUnavailableError(err);
     throw err;
   }
 }
@@ -123,10 +128,9 @@ export async function openChatStream({ messages, model, signal, options, meta })
     throw quotaExceededError();
   }
 
-  if (AUTO_FALLBACK && breakerOpen('cloudflare') && peb.isConfigured()) {
-    const response = await peb.chatStream({ messages, signal, options });
-    recordUsage({ fallback: true }).catch(() => {});
-    return { response, provider: 'peb', fallback_reason: 'breaker_open', log_id: null };
+  // Breaker open = CF outage. No PEB fallback on the normal chat flow.
+  if (breakerOpen('cloudflare')) {
+    throw cloudflareUnavailableError();
   }
 
   const tempId = `tmp_${crypto.randomBytes(8).toString('hex')}`;
@@ -142,16 +146,9 @@ export async function openChatStream({ messages, model, signal, options, meta })
     return { response: r.response, provider: 'cloudflare', log_id: realLogId };
   } catch (err) {
     releasePending(realLogId || tempId);
-    if (AUTO_FALLBACK && isTransient(err) && peb.isConfigured()) {
-      console.warn(`[aiProvider] Cloudflare stream open failed (${err.code}), falling back to PEB`);
-      const response = await peb.chatStream({ messages, signal, options });
-      recordUsage({ fallback: true }).catch(() => {});
-      return {
-        response, provider: 'peb',
-        fallback_reason: err.code === 'ERR_BREAKER_OPEN' ? 'breaker_open' : 'cloudflare_error',
-        log_id: null,
-      };
-    }
+    if (err.name === 'AbortError') throw err;
+    // CF transient failure → no PEB fallback; report unavailable.
+    if (isTransient(err)) throw cloudflareUnavailableError(err);
     throw err;
   }
 }
@@ -200,6 +197,6 @@ export async function currentMode() {
     rule: h.active_rule,
     manual_override: h.manual_override,
     effective_provider_now: h.effective_provider_now,
-    auto_fallback: AUTO_FALLBACK,
+    auto_fallback: false,   // auto-fallback to PEB removed from the normal chat flow
   };
 }

@@ -182,6 +182,18 @@ export async function analyzeImage(req, res) {
   } catch (err) {
     if (err.name === 'AbortError') return;
     console.error('[vision] upstream open error:', err.message);
+    // Cloudflare quota/outage → no PEB fallback; return a hard, user-facing
+    // message as a normal assistant reply (matches the text-chat behaviour).
+    if (err.code === 'ERR_QUOTA_EXCEEDED' || err.code === 'ERR_CF_UNAVAILABLE') {
+      const hard = err.code === 'ERR_QUOTA_EXCEEDED'
+        ? 'Hệ thống đã dùng hết hạn mức AI miễn phí trong hôm nay (Cloudflare Workers AI). Hạn mức sẽ tự đặt lại vào 00:00 UTC. Vui lòng thử lại sau.'
+        : 'Dịch vụ AI (Cloudflare Workers AI) hiện tạm thời không khả dụng. Vui lòng thử lại sau ít phút.';
+      res.write(`data: ${JSON.stringify({ type: 'chunk', content: hard })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'usage', provider: 'system', upstream_error: err.code, prompt_tokens: 0, completion_tokens: 0 })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+      res.end();
+      return;
+    }
     res.write(`data: ${JSON.stringify({ type: 'error', error: err.message, code: err.code || 'ERR_UPSTREAM' })}\n\n`);
     res.end();
     return;
