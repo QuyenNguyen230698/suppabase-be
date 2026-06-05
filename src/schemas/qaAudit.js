@@ -14,6 +14,8 @@ const filterFields = {
   from:     dateStr.optional(),
   to:       dateStr.optional(),
   flagged:  z.enum(['0', '1', 'true', 'false']).optional(),
+  // Only Q&A pairs that have at least one attached file.
+  has_files: z.enum(['0', '1', 'true', 'false']).optional(),
   sort:     z.enum(SORT_KEYS).optional(),
   dir:      z.enum(['asc', 'desc']).optional(),
 };

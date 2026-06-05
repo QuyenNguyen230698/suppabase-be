@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import { query } from '../db/index.js';
 import { sendError } from '../i18n/messages.js';
+import { sendOtpEmail } from '../services/emailService.js';
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const ACCESS_TTL_SEC = 60 * 60;              // 1h
@@ -74,7 +75,17 @@ export async function login(req, res) {
   // 5. Active account
   if (!user.is_active) return sendError(res, 403, 'ERR_ACCOUNT_DISABLED');
 
-  // 6. Lấy role cao nhất của user (qua bảng roles với level thấp nhất = quyền cao nhất)
+  // 6-8. Resolve role, refresh login stats, sign + issue tokens, respond.
+  return buildLoginResponse(user, req, res);
+}
+
+// Shared tail of a successful authentication (password login OR email OTP):
+// resolve top role → reset lock + bump login stats → sign JWT + issue refresh
+// token → return the standard auth response. `user` must carry the payload
+// columns (id, username, full_name, display_name, avatar_url, country_code,
+// timezone, language, permission_version, must_change_password).
+async function buildLoginResponse(user, req, res) {
+  // Top role (lowest level = highest privilege).
   const { rows: roleRows } = await query(
     `SELECT r.name AS role, r.display_name, r.level
      FROM user_node_roles unr
@@ -87,7 +98,6 @@ export async function login(req, res) {
   const topRole = roleRows[0]?.role || 'viewer';
   const topRoleDisplay = roleRows[0]?.display_name || 'Viewer';
 
-  // 7. Reset failed_attempts, cập nhật last_login_at
   await query(
     `UPDATE users
      SET failed_attempts  = 0,
@@ -98,7 +108,6 @@ export async function login(req, res) {
     [user.id]
   );
 
-  // 8. Sign JWT
   if (!JWT_SECRET) {
     console.error('[AUTH] JWT_SECRET is not configured');
     return res.status(500).json({ error: 'Server misconfiguration', code: 'ERR_INTERNAL' });
@@ -127,6 +136,101 @@ export async function login(req, res) {
     must_change_password: user.must_change_password,
     user: payload,
   });
+}
+
+// ── Email OTP login ──────────────────────────────────────────
+// Selects the same payload columns login() needs, so buildLoginResponse works.
+const USER_PAYLOAD_COLS = `
+  id, username, email, full_name, display_name, avatar_url, is_active,
+  must_change_password, country_code, timezone, language, permission_version
+`;
+
+const OTP_TTL_MS = 5 * 60 * 1000;   // 5 minutes
+const OTP_MAX_ATTEMPTS = 5;
+
+/**
+ * POST /api/auth/send-otp — { email }
+ * Always returns { success: true } regardless of whether the email exists, to
+ * avoid leaking which addresses are registered (user enumeration). Only sends a
+ * mail (and stores a code) when the email maps to an active user.
+ */
+export async function sendOtp(req, res) {
+  const { email } = req.body;
+
+  const { rows } = await query(
+    `SELECT id, is_active FROM users WHERE email = $1`,
+    [email]
+  );
+  const user = rows[0];
+
+  if (user && user.is_active) {
+    try {
+      const code = String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+      // Invalidate any prior un-consumed codes for this user.
+      await query(
+        `UPDATE email_otp_codes SET consumed_at = NOW()
+         WHERE user_id = $1 AND consumed_at IS NULL`,
+        [user.id]
+      );
+      await query(
+        `INSERT INTO email_otp_codes (user_id, code_hash, max_attempts, expires_at, ip, user_agent)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          user.id, sha256(code), OTP_MAX_ATTEMPTS,
+          new Date(Date.now() + OTP_TTL_MS),
+          req.ip || null, req.headers['user-agent']?.slice(0, 500) || null,
+        ]
+      );
+      await sendOtpEmail(email, code);   // best-effort; never surfaced to client
+    } catch (err) {
+      console.error('[AUTH] sendOtp failed:', err.message);
+      // Still return success — do not reveal anything to the client.
+    }
+  }
+
+  return res.json({ success: true });
+}
+
+/**
+ * POST /api/auth/verify-otp — { email, code }
+ * On success returns the same auth payload as password login.
+ */
+export async function verifyOtp(req, res) {
+  const { email, code } = req.body;
+
+  const { rows } = await query(
+    `SELECT ${USER_PAYLOAD_COLS} FROM users WHERE email = $1`,
+    [email]
+  );
+  const user = rows[0];
+  if (!user || !user.is_active) return sendError(res, 401, 'ERR_OTP_INVALID');
+
+  // Latest un-consumed, non-expired code for this user.
+  const { rows: otpRows } = await query(
+    `SELECT id, code_hash, attempts, max_attempts
+     FROM email_otp_codes
+     WHERE user_id = $1 AND consumed_at IS NULL AND expires_at > NOW()
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [user.id]
+  );
+  const otp = otpRows[0];
+  if (!otp) return sendError(res, 401, 'ERR_OTP_INVALID');
+
+  if (otp.attempts >= otp.max_attempts) {
+    // Too many wrong guesses — invalidate so the user must request a new code.
+    await query(`UPDATE email_otp_codes SET consumed_at = NOW() WHERE id = $1`, [otp.id]);
+    return sendError(res, 429, 'ERR_OTP_LOCKED');
+  }
+
+  if (sha256(code) !== otp.code_hash) {
+    await query(`UPDATE email_otp_codes SET attempts = attempts + 1 WHERE id = $1`, [otp.id]);
+    return sendError(res, 401, 'ERR_OTP_INVALID');
+  }
+
+  // Correct — consume the code, then issue tokens just like password login.
+  await query(`UPDATE email_otp_codes SET consumed_at = NOW() WHERE id = $1`, [otp.id]);
+  return buildLoginResponse(user, req, res);
 }
 
 // Rotate refresh token. Old refresh is marked revoked + replaced_by; access

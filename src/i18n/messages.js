@@ -9,6 +9,8 @@ export const MESSAGES = {
   ERR_INVALID_CREDENTIALS:  { en: 'Username or password is incorrect',      vi: 'Tên đăng nhập hoặc mật khẩu không đúng' },
   ERR_ACCOUNT_LOCKED:       { en: 'Account is temporarily locked',          vi: 'Tài khoản bị khóa tạm thời' },
   ERR_ACCOUNT_DISABLED:     { en: 'Account is disabled',                    vi: 'Tài khoản đã bị vô hiệu hóa' },
+  ERR_OTP_INVALID:          { en: 'Code is incorrect or expired',           vi: 'Mã không đúng hoặc đã hết hạn, vui lòng kiểm tra lại' },
+  ERR_OTP_LOCKED:           { en: 'Too many attempts. Request a new code.',  vi: 'Bạn đã nhập sai quá nhiều lần, vui lòng gửi lại mã' },
   ERR_TOKEN_INVALID:        { en: 'Token is invalid or expired',            vi: 'Phiên đăng nhập không hợp lệ hoặc đã hết hạn' },
   ERR_TOKEN_MISSING:        { en: 'Missing authentication token',           vi: 'Thiếu token xác thực' },
   ERR_STALE_PERMISSIONS:    { en: 'Permissions have changed. Please sign in again.', vi: 'Quyền đã thay đổi. Vui lòng đăng nhập lại.' },

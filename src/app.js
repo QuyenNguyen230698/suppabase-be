@@ -152,6 +152,8 @@ const loginLimiter = rateLimit({
   message: { error: 'Too many login attempts, slow down', code: 'ERR_RATE_LIMIT' },
 });
 app.use('/api/auth/login', loginLimiter);
+app.use('/api/auth/send-otp', loginLimiter);
+app.use('/api/auth/verify-otp', loginLimiter);
 app.use('/api/auth', authRoutes);
 
 // Public chat (no auth — for embedded widget on demo pages)

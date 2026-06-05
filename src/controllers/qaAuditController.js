@@ -25,9 +25,39 @@ const SORT_COLUMNS = {
 
 function isSuperAdmin(req)  { return req.user?.role === 'super_admin'; }
 
+// Files attached to a user message, surfaced for the audit UI's file viewer.
+// A document is "attached" to a Q&A pair when it is linked to the user message
+// directly (message_documents) OR uploaded into the same conversation. We emit
+// the same shape the chat UI's FilePreviewPopup expects:
+//   { document_id, name, type, kind, expires_at, r2_public_url }
+// `attached_files` is the aggregated JSON column; `has_files` is the boolean
+// used by the has_files filter (so we don't have to re-derive it client-side).
+const ATTACHMENTS_LATERAL = `
+  LEFT JOIN LATERAL (
+    SELECT
+      COALESCE(json_agg(json_build_object(
+        'document_id',   d.id,
+        'name',          d.name,
+        'type',          d.type,
+        'kind',          d.kind,
+        'expires_at',    d.expires_at,
+        'r2_public_url', d.r2_public_url
+      ) ORDER BY d.created_at ASC) FILTER (WHERE d.id IS NOT NULL), '[]') AS attached_files,
+      COUNT(d.id) > 0 AS has_files
+    FROM documents d
+    WHERE d.user_id = u.user_id
+      AND (
+        d.id IN (SELECT md.document_id FROM message_documents md WHERE md.message_id = u.message_id)
+        OR d.conversation_id = u.conversation_id
+      )
+  ) f ON TRUE
+`;
+
 // Build the shared WHERE clause + params for list/export from query filters.
-function buildFilter(query) {
-  const { user_id, agent_id, q, from, to, flagged } = query;
+// `wantsFiles` toggles the has_files predicate (only available when the query
+// joins the attachments lateral, i.e. list() — export omits it).
+function buildFilter(query, { wantsFiles = false } = {}) {
+  const { user_id, agent_id, q, from, to, flagged, has_files } = query;
   const where = [`u.role = 'user'`];
   const params = [];
   let i = 1;
@@ -37,6 +67,7 @@ function buildFilter(query) {
   if (to)       { where.push(`u.created_at <  $${i++}`); params.push(to); }
   if (q)        { where.push(`(u.content ILIKE $${i} OR (a.content ILIKE $${i}))`); params.push(`%${q}%`); i++; }
   if (flagged === '1' || flagged === 'true') where.push(`rv.flagged = TRUE`);
+  if (wantsFiles && (has_files === '1' || has_files === 'true')) where.push(`f.has_files = TRUE`);
   return { whereSql: where.join(' AND '), params, nextIdx: i };
 }
 
@@ -69,7 +100,7 @@ export async function list(req, res) {
   const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(limit, 10) || 25));
   const offset = (pageNum - 1) * pageSize;
 
-  const { whereSql, params, nextIdx } = buildFilter(req.query);
+  const { whereSql, params, nextIdx } = buildFilter(req.query, { wantsFiles: true });
   let i = nextIdx;
 
   // Count for pagination
@@ -83,6 +114,7 @@ export async function list(req, res) {
       ORDER BY created_at ASC LIMIT 1
     ) a ON TRUE
     LEFT JOIN qa_review rv ON rv.message_id = u.message_id
+    ${ATTACHMENTS_LATERAL}
     WHERE ${whereSql}
   `;
   const dataSql = `
@@ -98,6 +130,7 @@ export async function list(req, res) {
       a.model               AS answer_model,
       a.tokens_out          AS answer_tokens,
       a.created_at          AS answered_at,
+      f.attached_files,
       rv.flagged, rv.flag_reason, rv.note, rv.reviewed_by, rv.reviewed_at
     FROM v_qa_audit u
     LEFT JOIN LATERAL (
@@ -107,6 +140,7 @@ export async function list(req, res) {
       ORDER BY created_at ASC LIMIT 1
     ) a ON TRUE
     LEFT JOIN qa_review rv ON rv.message_id = u.message_id
+    ${ATTACHMENTS_LATERAL}
     WHERE ${whereSql}
     ${orderClause(sort, dir)}
     LIMIT $${i++} OFFSET $${i++}
@@ -120,13 +154,18 @@ export async function list(req, res) {
     ]);
 
     const isSA = isSuperAdmin(req);
-    const items = dataRes.rows.map(r => isSA ? r : ({
-      ...r,
-      email:     maskEmail(r.email),
-      full_name: r.full_name,
-      question:  maskText(r.question),
-      answer:    maskText(r.answer),
-    }));
+    const items = dataRes.rows.map(r => {
+      const base = isSA ? r : {
+        ...r,
+        email:     maskEmail(r.email),
+        full_name: r.full_name,
+        question:  maskText(r.question),
+        answer:    maskText(r.answer),
+      };
+      // Files are metadata (name/type/kind) — not masked. Normalise to [].
+      base.attached_files = Array.isArray(r.attached_files) ? r.attached_files : [];
+      return base;
+    });
 
     logAccess(req, 'list', null, { count: items.length, filters: req.query });
 
@@ -161,9 +200,22 @@ export async function getConversation(req, res) {
 
     const msgs = await query(
       `SELECT m.id, m.role, m.content, m.model, m.tokens_in, m.tokens_out, m.created_at,
-              rv.flagged, rv.flag_reason, rv.note
+              rv.flagged, rv.flag_reason, rv.note,
+              f.attached_files
        FROM messages m
        LEFT JOIN qa_review rv ON rv.message_id = m.id
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(json_agg(json_build_object(
+                  'document_id',   d.id,
+                  'name',          d.name,
+                  'type',          d.type,
+                  'kind',          d.kind,
+                  'expires_at',    d.expires_at,
+                  'r2_public_url', d.r2_public_url
+                ) ORDER BY d.created_at ASC) FILTER (WHERE d.id IS NOT NULL), '[]') AS attached_files
+           FROM documents d
+          WHERE d.id IN (SELECT md.document_id FROM message_documents md WHERE md.message_id = m.id)
+       ) f ON TRUE
        WHERE m.conversation_id = $1 AND m.is_deleted = FALSE
        ORDER BY m.created_at ASC`,
       [convId]
@@ -174,7 +226,11 @@ export async function getConversation(req, res) {
       ...conv.rows[0],
       email:     maskEmail(conv.rows[0].email),
     };
-    const messages = msgs.rows.map(m => isSA ? m : ({ ...m, content: maskText(m.content) }));
+    const messages = msgs.rows.map(m => {
+      const base = isSA ? m : { ...m, content: maskText(m.content) };
+      base.attached_files = Array.isArray(m.attached_files) ? m.attached_files : [];
+      return base;
+    });
 
     logAccess(req, 'reveal', convId, { messages: messages.length });
 
