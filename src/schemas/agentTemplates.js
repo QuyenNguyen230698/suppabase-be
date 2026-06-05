@@ -3,10 +3,14 @@ import { isAllowedChatModel } from '../services/modelRegistry.js';
 
 const SLUG_RE = /^[a-z0-9-]{2,64}$/;
 const ICON_VALUES = ['sparkles', 'file-text', 'pen-tool', 'code', 'bot'];
-const CATEGORIES  = ['general', 'document', 'writing', 'coding'];
+// 'pro' = the Pro Plan / PEB agent category (gated behind pro_plan permission).
+const CATEGORIES  = ['general', 'document', 'writing', 'coding', 'pro'];
 const VISIBILITY  = ['global', 'org', 'private'];
 const SEVERITIES  = ['soft', 'block_regex', 'block_llm'];
 const TOOLS       = ['search_documents', 'get_current_time', 'calculator'];
+// FE pseudo-model that routes a chat to the PEB ('pro') source. Allowed as an
+// agent's pinned model even though it isn't a real Cloudflare chat model.
+const PEB_MODEL_VALUE = '__peb__';
 
 // Reject invalid regex patterns at validation time (before they hit DB)
 const safeRegex = z.string().min(1).refine((p) => {
@@ -48,7 +52,8 @@ const baseFields = {
   // must be in the chat allow-list (modelRegistry), so an agent can't pin a
   // removed/unsupported model.
   model: z.string().max(200).nullable().optional()
-    .refine((m) => !m || isAllowedChatModel(m), { message: 'model must be an allowed chat model or null' }),
+    .refine((m) => !m || m === PEB_MODEL_VALUE || isAllowedChatModel(m),
+      { message: 'model must be an allowed chat model, __peb__, or null' }),
 };
 
 export const createAgentTemplateBody = z.object({
