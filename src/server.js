@@ -1,7 +1,7 @@
 import app from './app.js';
 import { migrate, closePool } from './db/index.js';
 import { bootJobs } from './services/jobs/index.js';
-import { resumePending } from './services/usageReconciler.js';
+import { resumePending } from './services/queue/usageReconciler.js';
 import { migrateFromEnv as migrateProviderEnv } from './services/providerRouter.js';
 import { startWorker as startIngestWorker } from './services/ingest/queue/worker.js';
 

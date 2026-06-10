@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { query } from '../db/index.js';
 import { chat as aiChat, openChatStream } from '../services/aiProvider.js';
 import { extractTextFromImage } from '../services/ocrService.js';
-import { scheduleReconcile } from '../services/usageReconciler.js';
+import { scheduleReconcile } from '../services/queue/usageReconciler.js';
 import { MODELS } from '../services/modelRegistry.js';
 
 const VISION_MODEL = MODELS.vision;

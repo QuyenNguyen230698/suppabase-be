@@ -1,5 +1,5 @@
-import { query } from '../db/index.js';
-import { deleteManyFromR2 } from './r2Service.js';
+import { query } from '../../db/index.js';
+import { deleteManyFromR2 } from '../r2Service.js';
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000; // run every 6 hours
 const ORPHAN_TTL_DAYS = 7;

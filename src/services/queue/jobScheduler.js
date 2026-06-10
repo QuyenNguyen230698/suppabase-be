@@ -9,7 +9,7 @@
 // Swap-in plan for prod: replace `start()` with pg-boss boot; jobs already
 // declare `run` as plain async functions so the contract is portable.
 
-import { query } from '../db/index.js';
+import { query } from '../../db/index.js';
 
 const REGISTRY = new Map();
 let started = false;

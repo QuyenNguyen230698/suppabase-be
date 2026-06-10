@@ -7,7 +7,7 @@
 
 import { stripLeadingThinking } from '../../thinkingStripper.js';
 import { scanOutputHarmful, scanOutput, logHarmfulOutput, autoFlagMessage } from '../../guardService.js';
-import { scheduleReconcile } from '../../usageReconciler.js';
+import { scheduleReconcile } from '../../queue/usageReconciler.js';
 import { saveAssistantMessage } from '../persistence.js';
 import * as cacheCore from './cacheCore.js';
 

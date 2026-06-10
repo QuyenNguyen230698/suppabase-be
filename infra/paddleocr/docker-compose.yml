@@ -1,0 +1,40 @@
+# PaddleOCR sidecar for the OCR ingestion core.
+#
+# This runs INDEPENDENTLY of the Node backend (which is managed by PM2). The
+# backend is just an HTTP client of this service (paddleClient.js → POST /ocr),
+# so restarting the Node app with `pm2 restart` does NOT touch this container.
+#
+# `restart: unless-stopped` means the container comes back on its own after a
+# crash or a VPS reboot — you never have to restart Docker by hand to keep OCR
+# working. Bring it up once:
+#
+#   cd infra/paddleocr
+#   docker compose up -d --build
+#
+# Then point the Node service at it (in suppabase-be/.env.production):
+#   PADDLE_OCR_URL=http://localhost:8900
+#
+# Check status / logs:
+#   docker compose ps
+#   docker compose logs -f
+#
+# (If the backend runs in its own container too and they share a Docker network,
+#  use PADDLE_OCR_URL=http://paddleocr:8900 instead of localhost.)
+
+services:
+  paddleocr:
+    build: .
+    image: suppabase-paddleocr
+    container_name: paddleocr
+    restart: unless-stopped
+    ports:
+      - "8900:8900"
+    healthcheck:
+      # python:3.10-slim has no curl/wget — use the bundled Python instead.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8900/health', timeout=5).status==200 else sys.exit(1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # First boot downloads + warms the OCR model (heavy); don't mark unhealthy
+      # while that's still happening.
+      start_period: 180s

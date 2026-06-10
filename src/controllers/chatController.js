@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { query } from '../db/index.js';
 import { chat as aiChat, openChatStream } from '../services/aiProvider.js';
 import { shouldFallback as quotaExceeded } from '../services/neuronsTracker.js';
-import { enqueue, subscribe, stats as queueStats } from '../services/chatQueue.js';
+import { enqueue, subscribe, stats as queueStats } from '../services/queue/chatQueue.js';
 import { similaritySearch, similaritySearchInConversation, buildContext, buildAttachmentManifest } from '../services/ragService.js';
 import { resolveLocale, buildSystemPrompt } from '../services/promptService.js';
 import { extractTextFromImage, describeImagesByUrl } from '../services/ocrService.js';

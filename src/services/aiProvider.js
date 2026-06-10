@@ -8,7 +8,7 @@ import {
   releasePending,
   rekeyPending,
 } from './neuronsTracker.js';
-import { recordPending, scheduleReconcile } from './usageReconciler.js';
+import { recordPending, scheduleReconcile } from './queue/usageReconciler.js';
 import { withBreaker, isOpen as breakerOpen } from './circuitBreaker.js';
 import { resolveProvider } from './providerRouter.js';
 

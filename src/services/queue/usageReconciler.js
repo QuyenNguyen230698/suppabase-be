@@ -12,9 +12,9 @@
 //   4. On success, store tokens/neurons/cost/duration and bust the daily-cache
 //      so the next getToday() recomputes from ai_usage_log.
 
-import { query } from '../db/index.js';
-import { fetchLog, isGatewayConfigured } from './gatewayLogsService.js';
-import { invalidateCache, releasePending } from './neuronsTracker.js';
+import { query } from '../../db/index.js';
+import { fetchLog, isGatewayConfigured } from '../gatewayLogsService.js';
+import { invalidateCache, releasePending } from '../neuronsTracker.js';
 
 // Backoff schedule (ms). Total ≈ 5 minutes — enough for any reasonable stream
 // to finish AND get indexed by the AI Gateway Logs pipeline.

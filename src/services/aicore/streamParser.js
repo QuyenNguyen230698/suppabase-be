@@ -120,7 +120,14 @@ export function createStreamParser(sink) {
   }
 
   function handleContentToken(token) {
-    if (!inThink && !thinkEmitted) {
+    // Always scan for a "<think>" opener while not already inside one — even if
+    // we've ALREADY received thinking via a dedicated `thinking`/`reasoning_content`
+    // field. Some r1-style models emit BOTH: structured thinking deltas AND an
+    // inline <think>…</think> block inside the content stream. The old guard
+    // (`!thinkEmitted`) skipped the strip once any thinking arrived, so that
+    // inline block leaked verbatim into the answer. Stripping unconditionally
+    // keeps the visible content clean in every case.
+    if (!inThink) {
       thinkBuf += token;
       const openIdx = thinkBuf.indexOf('<think>');
       if (openIdx !== -1) {
@@ -133,6 +140,7 @@ export function createStreamParser(sink) {
         thinkBuf = thinkBuf.slice(openIdx + 7);
         return;
       }
+      // Hold back up to 6 chars in case a "<think" opener is mid-arrival.
       if (thinkBuf.length > 6) {
         const safe = thinkBuf.slice(0, -6);
         fullContent += safe;

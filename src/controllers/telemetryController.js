@@ -2,7 +2,7 @@
 // All endpoints require adminOnly (mounted that way in routes).
 
 import { query } from '../db/index.js';
-import { listJobs, runNow } from '../services/jobScheduler.js';
+import { listJobs, runNow } from '../services/queue/jobScheduler.js';
 
 // ── GET /api/admin/telemetry/summary ──────────────────────────
 // Last-N-days aggregates for a small dashboard.
