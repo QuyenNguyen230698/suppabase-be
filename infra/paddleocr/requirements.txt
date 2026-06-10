@@ -2,6 +2,9 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 paddleocr==2.8.1
-paddlepaddle==2.6.1
+# paddlepaddle 2.6.1 was yanked from PyPI; 2.6.2 is the oldest available in the
+# 2.6.x line and stays compatible with paddleocr 2.8.1 (avoid 3.x — its API
+# changes break paddleocr 2.8). Pin to the 2.6.x range for reproducible builds.
+paddlepaddle>=2.6.2,<3.0
 pillow==10.4.0
 numpy==1.26.4
